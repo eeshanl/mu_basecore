@@ -1164,6 +1164,14 @@ NonCoherentPciIoAllocateBuffer (
     MemType |= EFI_MEMORY_UC;
   }
 
+  // Set override Write Combine attributes if Dev->Device->OverrideWithWriteCombine is set 
+  // if ((Dev->Device->OverrideWithWriteCombine & mask != 0)) {
+  //   MemType = EFI_MEMORY_XP | (OverrideWithWriteCombine & mask);
+  // }
+  if ((Dev->Device->OverrideWithWriteCombine)) {
+    MemType = EFI_MEMORY_XP | EFI_MEMORY_WC;
+  }
+
   Alloc = AllocatePool (sizeof *Alloc);
   if (Alloc == NULL) {
     goto FreeBuffer;

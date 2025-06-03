@@ -64,6 +64,10 @@ struct _NON_DISCOVERABLE_DEVICE {
   // The MMIO and I/O regions owned by the device
   //
   EFI_ACPI_ADDRESS_SPACE_DESCRIPTOR    *Resources;
+  //
+  // Boolean to indicate whether we will override the default attributes with Write Combine
+  //
+  BOOLEAN                               OverrideWithWriteCombine;
 };
 
 extern EFI_GUID  gEdkiiNonDiscoverableDeviceProtocolGuid;
