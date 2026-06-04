@@ -181,6 +181,45 @@ IoMmuSetAttribute (
 }
 
 /**
+  Set the R/W access attributes for Mapping in the Page Table for a caller
+  that explicitly specifies (IommuBase, DmaId) instead of an EFI_HANDLE.
+
+  @param [in]  IommuBase     Base MMIO address of the IOMMU that owns DmaId.
+  @param [in]  DmaId     DMA identifier emitted by the calling DMA agent (e.g. StreamID on Arm SMMU, RequesterID on VT-d).
+  @param [in]  Mapping      The mapping to set attributes for. Returned from IoMmuMap.
+  @param [in]  IoMmuAccess  The IOMMU access attributes.
+
+  @retval EFI_SUCCESS            Success.
+  @retval EFI_NOT_READY          The IoMmu protocol is not ready.
+  @retval EFI_UNSUPPORTED        The IoMmu protocol producer does not implement
+                                 SetAttributeById.
+  @retval Other                  Other errors as defined by the IoMmu protocol.
+**/
+EFI_STATUS
+EFIAPI
+IoMmuSetAttributeById (
+  IN UINT64  IommuBase,
+  IN UINT32  DmaId,
+  IN VOID    *Mapping,
+  IN UINT64  IoMmuAccess
+  )
+{
+  if (mIoMmuProtocol == NULL) {
+    DEBUG ((DEBUG_ERROR, "%a: IoMmuProtocol is NULL\n", __func__));
+    ASSERT (FALSE);
+    return EFI_NOT_READY;
+  }
+
+  if (mIoMmuProtocol->SetAttributeById == NULL) {
+    DEBUG ((DEBUG_ERROR, "%a: SetAttributeById not implemented by IoMmu producer\n", __func__));
+    ASSERT (FALSE);
+    return EFI_UNSUPPORTED;
+  }
+
+  return mIoMmuProtocol->SetAttributeById (mIoMmuProtocol, IommuBase, DmaId, Mapping, IoMmuAccess);
+}
+
+/**
   Event notification that is fired when IOMMU protocol is installed.
 
   @param [in] Event               The Event that is being processed.
@@ -250,6 +289,13 @@ IoMmuLibInit (
       ASSERT_EFI_ERROR (Status);
       gBS->CloseEvent (mIoMmuEvent);
     }
+  }
+
+  // Check if version is atleast EDKII_IOMMU_PROTOCOL_REVISION, if not, return unsupported
+  if ((mIoMmuProtocol != NULL) && (mIoMmuProtocol->Revision < EDKII_IOMMU_PROTOCOL_REVISION)) {
+    DEBUG ((DEBUG_ERROR, "%a: IoMmuProtocol revision 0x%llx is less than the required revision 0x%llx\n", __func__, mIoMmuProtocol->Revision, EDKII_IOMMU_PROTOCOL_REVISION));
+    ASSERT (FALSE);
+    return EFI_UNSUPPORTED;
   }
 
   return Status;
