@@ -999,7 +999,119 @@ SmmuV3RegisterGicIsr (
 }
 
 /**
-  Send a SMMUV3_CMD_GENERIC command to the SMMUv3.
+  Submit a batch of SMMUv3 commands and wait once for the SMMU to drain past
+  the final command in the batch.
+
+  This is the canonical way to issue more than one command. The batch is
+  pushed to the SMMU command queue in chunks sized to the queue capacity;
+  each chunk takes one room-check + ring-write + producer-pointer publish
+  under a TPL_HIGH_LEVEL critical section. A single completion wait at the
+  end covers the entire submission because the SMMU drains commands in
+  queue order.
+
+  @param [in]  SmmuInfo      Pointer to the SMMU_INFO structure.
+  @param [in]  CommandCount  Number of commands in the batch. 0 is a no-op.
+  @param [in]  Commands      Array of CommandCount commands to submit, in
+                             order.
+
+  @retval EFI_SUCCESS            Success.
+  @retval EFI_TIMEOUT            Timeout.
+  @retval EFI_INVALID_PARAMETER  Invalid Parameters.
+**/
+EFI_STATUS
+SmmuV3SendCommands (
+  IN SMMU_INFO           *SmmuInfo,
+  IN UINT32              CommandCount,
+  IN SMMUV3_CMD_GENERIC  *Commands
+  )
+{
+  UINT32      QueueMask;
+  UINT32      WrapMask;
+  UINT32      TotalQueueEntries;
+  UINT32      MaxChunk;
+  UINT32      ConsumerIndex;
+  UINT32      ConsumerWrap;
+  UINT32      FreeSlots;
+  UINT32      Submitted;
+  UINT32      ChunkSize;
+  EFI_STATUS  Status;
+  EFI_TPL     OldTpl;
+  UINT64      StartingIndex;
+  UINT64      NewProducer;
+
+  if ((SmmuInfo == NULL) || (Commands == NULL)) {
+    DEBUG ((DEBUG_ERROR, "%a: Invalid Parameters\n", __func__));
+    return EFI_INVALID_PARAMETER;
+  }
+
+  if (CommandCount == 0) {
+    return EFI_SUCCESS;
+  }
+
+  TotalQueueEntries = SMMUV3_COUNT_FROM_LOG2 (SmmuInfo->CommandQueueLog2Size);
+  WrapMask          = TotalQueueEntries;
+  QueueMask         = WrapMask - 1;
+  // Reserve one slot of safety so the room check never has to consider a
+  // wrap with the lock held.
+  MaxChunk          = TotalQueueEntries - 1;
+
+  Submitted   = 0;
+  NewProducer = 0;
+  while (Submitted < CommandCount) {
+    ChunkSize = CommandCount - Submitted;
+    if (ChunkSize > MaxChunk) {
+      ChunkSize = MaxChunk;
+    }
+
+    // Critical section spans the room check, ring writes, and the single
+    // producer-pointer publish for this chunk so a concurrent caller can't
+    // interleave another batch into the same slots. TPL is released between
+    // chunks so we don't hold the lock while the SMMU drains.
+    OldTpl = gBS->RaiseTPL (TPL_HIGH_LEVEL);
+
+    // CachedProducer and CachedConsumer are monotonically increasing
+    // counters; free slots = TotalQueueEntries - (Producer - Consumer).
+    // SmmuV3CmdQueueUpdateCachedConsumer reads the live CMDQ_CONS register
+    // and refreshes CachedConsumer, including wrap-bit promotion.
+    do {
+      SmmuV3CmdQueueUpdateCachedConsumer (SmmuInfo, QueueMask, WrapMask, TotalQueueEntries, &ConsumerIndex, &ConsumerWrap);
+      FreeSlots = TotalQueueEntries - (UINT32)(SmmuInfo->CachedProducer - SmmuInfo->CachedConsumer);
+    } while (FreeSlots < ChunkSize);
+
+    StartingIndex = SmmuInfo->CachedProducer & QueueMask;
+    Status        = SmmuV3WriteCommands (SmmuInfo, (UINT32)StartingIndex, ChunkSize, &Commands[Submitted]);
+    if (EFI_ERROR (Status)) {
+      DEBUG ((DEBUG_ERROR, "%a: WriteCommands failed: %r\n", __func__, Status));
+      gBS->RestoreTPL (OldTpl);
+      return Status;
+    }
+
+    // One producer-register write publishes this whole chunk atomically.
+    SmmuInfo->CachedProducer += ChunkSize;
+    NewProducer               = SmmuInfo->CachedProducer;
+    SmmuV3WriteRegister32 (SmmuInfo->SmmuBase, SMMU_CMDQ_PROD, (UINT32)(NewProducer & (WrapMask | QueueMask)));
+
+    gBS->RestoreTPL (OldTpl);
+
+    Submitted += ChunkSize;
+  }
+
+  // Single drain wait covering every command we just submitted. The SMMU
+  // processes commands in queue order so observing the consumer past the
+  // final NewProducer implies every earlier command is consumed too.
+  do {
+    OldTpl = gBS->RaiseTPL (TPL_HIGH_LEVEL);
+    SmmuV3CmdQueueUpdateCachedConsumer (SmmuInfo, QueueMask, WrapMask, TotalQueueEntries, &ConsumerIndex, &ConsumerWrap);
+    gBS->RestoreTPL (OldTpl);
+  } while (SmmuInfo->CachedConsumer < NewProducer);
+
+  return EFI_SUCCESS;
+}
+
+/**
+  Send a single SMMUV3_CMD_GENERIC command to the SMMUv3 and wait for it to be
+  consumed. Thin wrapper over SmmuV3SendCommands for callers that only need
+  to submit one command.
 
   @param [in]  SmmuInfo  Pointer to the SMMU_INFO structure.
   @param [in]  Command   Pointer to the command to send.
@@ -1014,64 +1126,7 @@ SmmuV3SendCommand (
   IN SMMUV3_CMD_GENERIC  *Command
   )
 {
-  UINT32            QueueMask;
-  UINT32            WrapMask;
-  UINT32            TotalQueueEntries;
-  UINT32            ProducerIndex;
-  UINT32            ConsumerIndex;
-  UINT32            ProducerWrap;
-  UINT32            ConsumerWrap;
-  SMMUV3_CMDQ_PROD  Producer;
-  EFI_STATUS        Status;
-  EFI_TPL           OldTpl;
-  UINT64            NewProducer;
-
-  if ((SmmuInfo == NULL) || (Command == NULL)) {
-    DEBUG ((DEBUG_ERROR, "%a: Invalid Parameters\n", __func__));
-    return EFI_INVALID_PARAMETER;
-  }
-
-  TotalQueueEntries = SMMUV3_COUNT_FROM_LOG2 (SmmuInfo->CommandQueueLog2Size);
-  WrapMask          = TotalQueueEntries;
-  QueueMask         = WrapMask - 1;
-
-  // We need to synchronize the the entire command queue write and producer update with the TPL locks.
-  // As a result we don't just lock SmmuV3CmdQueueUpdateCachedConsumer but the entire process of writing the command
-  // and updating the producer index.
-  OldTpl = gBS->RaiseTPL (TPL_HIGH_LEVEL);
-
-  // Loop until there is space in the command queue
-  do {
-    Producer.AsUINT32 = SmmuV3ReadRegister32 (SmmuInfo->SmmuBase, SMMU_CMDQ_PROD);
-    ProducerWrap      = Producer.WriteIndex & WrapMask;
-    ProducerIndex     = Producer.WriteIndex & QueueMask;
-
-    SmmuV3CmdQueueUpdateCachedConsumer (SmmuInfo, QueueMask, WrapMask, TotalQueueEntries, &ConsumerIndex, &ConsumerWrap);
-  } while (SMMUV3_IS_QUEUE_FULL (ProducerIndex, ProducerWrap, ConsumerIndex, ConsumerWrap) != FALSE);
-
-  Status = SmmuV3WriteCommands (SmmuInfo, ProducerIndex, 1, Command);
-  if (EFI_ERROR (Status)) {
-    DEBUG ((DEBUG_ERROR, "%a: Error writing command to queue\n", __func__));
-    gBS->RestoreTPL (OldTpl);
-    return Status;
-  }
-
-  SmmuInfo->CachedProducer += 1;
-  NewProducer               = SmmuInfo->CachedProducer;
-  SmmuV3WriteRegister32 (SmmuInfo->SmmuBase, SMMU_CMDQ_PROD, (UINT32)(NewProducer & (WrapMask | QueueMask)));
-
-  gBS->RestoreTPL (OldTpl);
-
-  // Loop until the command is consumed
-  do {
-    // SmmuV3CmdQueueUpdateCachedConsumer needs to be within the scope of this lock because we want to make sure we have
-    // the synchronized view of the consumer index when checking against the current local producer index.
-    OldTpl = gBS->RaiseTPL (TPL_HIGH_LEVEL);
-    SmmuV3CmdQueueUpdateCachedConsumer (SmmuInfo, QueueMask, WrapMask, TotalQueueEntries, &ConsumerIndex, &ConsumerWrap);
-    gBS->RestoreTPL (OldTpl);
-  } while (SmmuInfo->CachedConsumer < NewProducer);
-
-  return Status;
+  return SmmuV3SendCommands (SmmuInfo, 1, Command);
 }
 
 /**
@@ -1119,52 +1174,125 @@ SmmuV3TLBInvalidateAll (
 }
 
 /**
-  Invalidate TLB entries for specified InputAddress for Stage 2 of SmmuV3.
+  Invalidate TLB entries for a contiguous range starting at InputAddress and
+  covering Bytes (rounded up to page granularity) for Stage 2 of SmmuV3.
+
+  Builds one CMD_TLBI_S2_IPA per page over the entire range and submits the
+  whole batch in a single SmmuV3SendCommands call. SendCommands handles
+  command-queue-capacity chunking internally, so this routine sees one
+  drain wait for the whole submission regardless of range size. A final
+  CMD_SYNC is then sent to guarantee TLB invalidation completion per
+  SMMUv3.2 spec section 4.6.3.
 
   @param [in]  SmmuInfo      Pointer to the SMMU_INFO structure.
   @param [in]  Vmid          The VMID to invalidate.
-  @param [in]  InputAddress  The input address to invalidate.
+  @param [in]  InputAddress  Base input address of the range.
+  @param [in]  Bytes         Range length in bytes. Must be > 0.
 
   @retval EFI_SUCCESS            Success.
   @retval EFI_TIMEOUT            Timeout.
   @retval EFI_INVALID_PARAMETER  Invalid Parameters.
+  @retval EFI_OUT_OF_RESOURCES   Failed to allocate the batch buffer.
 **/
 EFI_STATUS
 SmmuV3TLBInvalidateAddress (
   IN SMMU_INFO  *SmmuInfo,
   IN UINT16     Vmid,
-  IN UINT64     InputAddress
+  IN UINT64     InputAddress,
+  IN UINT64     Bytes
   )
 {
-  SMMUV3_CMD_GENERIC  Command;
-  EFI_STATUS          Status;
+  EFI_STATUS            Status;
+  SMMUV3_CMD_GENERIC    *Batch;
+  SMMUV3_CMD_GENERIC    SyncCommand;
+  EFI_PHYSICAL_ADDRESS  CurAddress;
+  EFI_PHYSICAL_ADDRESS  EndAddress;
+  UINTN                 NumPages;
+  UINTN                 Index;
 
-  if (SmmuInfo == NULL) {
+  if ((SmmuInfo == NULL) || (Bytes == 0)) {
     DEBUG ((DEBUG_ERROR, "%a: Invalid Parameters\n", __func__));
     return EFI_INVALID_PARAMETER;
   }
 
-  // Invalidate the per-stream {VMID, IPA} entry. Vmid was allocated for
-  // this StreamID by SmmuV3StreamGetOrCreate.
-  SMMUV3_BUILD_CMD_TLBI_S2_IPA (&Command, Vmid, InputAddress);
-  Status = SmmuV3SendCommand (SmmuInfo, &Command);
+  EndAddress = ALIGN_VALUE (InputAddress + Bytes, EFI_PAGE_SIZE);
+  NumPages   = (UINTN)((EndAddress - InputAddress) / EFI_PAGE_SIZE);
+
+  // Including the trailing CMD_SYNC, this call submits NumPages + 1
+  // commands to the SMMU command queue for the requested IPA range.
+  // QueueEntries is the queue capacity; InFlight is how many entries are
+  // currently outstanding (producer - consumer) before we submit the batch.
+  DEBUG ((
+    DEBUG_VERBOSE,
+    "%a: SmmuBase=0x%llx Vmid=0x%x IPA=0x%llx Bytes=0x%llx -> %u TLBI cmds (+1 SYNC) | CMDQ entries=%u in-flight=%u\n",
+    __func__,
+    SmmuInfo->SmmuBase,
+    Vmid,
+    InputAddress,
+    Bytes,
+    (UINT32)NumPages,
+    SMMUV3_COUNT_FROM_LOG2 (SmmuInfo->CommandQueueLog2Size),
+    (UINT32)(SmmuInfo->CachedProducer - SmmuInfo->CachedConsumer)
+    ));
+
+  Batch = AllocatePool (NumPages * sizeof (SMMUV3_CMD_GENERIC));
+  if (Batch == NULL) {
+    DEBUG ((DEBUG_ERROR, "%a: AllocatePool failed for %u pages\n", __func__, (UINT32)NumPages));
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  // Fill the batch buffer with one TLBI_S2_IPA per page over the entire
+  // range. Vmid was allocated for this StreamID by SmmuV3StreamGetOrCreate.
+  CurAddress = InputAddress;
+  for (Index = 0; Index < NumPages; Index++) {
+    SMMUV3_BUILD_CMD_TLBI_S2_IPA (&Batch[Index], Vmid, CurAddress);
+    CurAddress += EFI_PAGE_SIZE;
+  }
+
+  // Submit the entire batch in one call. SendCommands chunks internally if
+  // NumPages exceeds the SMMU command queue capacity.
+  Status = SmmuV3SendCommands (SmmuInfo, (UINT32)NumPages, Batch);
+  FreePool (Batch);
   if (EFI_ERROR (Status)) {
-    DEBUG ((DEBUG_ERROR, "%a: CMD_TLBI_S2_IPA failed.\n", __func__));
+    DEBUG ((DEBUG_ERROR, "%a: Batched CMD_TLBI_S2_IPA failed: %r\n", __func__, Status));
     return Status;
   }
 
-  // Issue a CMD_SYNC command to guarantee that any previously issued TLB
-  // invalidations (CMD_TLBI_*) are completed (SMMUv3.2 spec section 4.6.3).
-  SMMUV3_BUILD_CMD_SYNC_NO_INTERRUPT (&Command);
-  Status = SmmuV3SendCommand (SmmuInfo, &Command);
+  // Final CMD_SYNC guarantees every previously issued TLBI has completed
+  // (SMMUv3.2 spec section 4.6.3).
+  SMMUV3_BUILD_CMD_SYNC_NO_INTERRUPT (&SyncCommand);
+  Status = SmmuV3SendCommand (SmmuInfo, &SyncCommand);
   if (EFI_ERROR (Status)) {
-    DEBUG ((DEBUG_ERROR, "%a: CMD_SYNC_NO_INTERRUPT failed.\n", __func__));
+    DEBUG ((DEBUG_ERROR, "%a: CMD_SYNC_NO_INTERRUPT failed: %r\n", __func__, Status));
     return Status;
   }
 
   ArmDataSynchronizationBarrier ();
 
-  return Status;
+  // Post-call snapshot of the SMMU command queue: hardware producer/consumer
+  // (live CMDQ_PROD/CMDQ_CONS registers) and our monotonic cached counters.
+  // After this point both should match -- the SYNC above drained the queue.
+  {
+    SMMUV3_CMDQ_PROD  Producer;
+    SMMUV3_CMDQ_CONS  Consumer;
+
+    Producer.AsUINT32 = SmmuV3ReadRegister32 (SmmuInfo->SmmuBase, SMMU_CMDQ_PROD);
+    Consumer.AsUINT32 = SmmuV3ReadRegister32 (SmmuInfo->SmmuBase, SMMU_CMDQ_CONS);
+    DEBUG ((
+      DEBUG_VERBOSE,
+      "%a: post-SYNC SmmuBase=0x%llx hw CMDQ_PROD=0x%x CMDQ_CONS=0x%x cached Prod=0x%llx Cons=0x%llx | CMDQ entries=%u in-flight=%u\n",
+      __func__,
+      SmmuInfo->SmmuBase,
+      Producer.WriteIndex,
+      Consumer.ReadIndex,
+      SmmuInfo->CachedProducer,
+      SmmuInfo->CachedConsumer,
+      SMMUV3_COUNT_FROM_LOG2 (SmmuInfo->CommandQueueLog2Size),
+      (UINT32)(SmmuInfo->CachedProducer - SmmuInfo->CachedConsumer)
+      ));
+  }
+
+  return EFI_SUCCESS;
 }
 
 /**

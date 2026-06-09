@@ -293,8 +293,10 @@ that STE's page-table root with another stream (the alias case below):
   place to point at the same root with the same `S2VMID`. If the alias STE already encodes the same `(Root, Vmid)`
   this is a no-op. That's how multiple StreamIDs share one mapping - they all resolve through the same VMID tag, so
   a single TLB invalidation by `(VMID, IPA)` covers every alias.
-- `UpdatePageTable` issues `SmmuV3TLBInvalidateAddress (SmmuInfo, Vmid, IPA)` on unmap. Because the VMID is unique
-  per root, that invalidation can't accidentally evict another device's translations.
+- `UpdatePageTable` issues one batched `SmmuV3TLBInvalidateAddress (SmmuInfo, Vmid, Base, Bytes)` after the unmap
+  loop. That queues one `CMD_TLBI_S2_IPA` per page over the whole range and drains the SMMU command queue with a
+  single `CMD_SYNC` at the end. Because the VMID is unique per root, that invalidation can't accidentally evict
+  another device's translations.
 
 ### End-to-end Flow Diagram
 

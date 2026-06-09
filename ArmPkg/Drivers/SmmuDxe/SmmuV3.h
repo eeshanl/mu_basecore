@@ -483,7 +483,9 @@ SmmuV3RegisterGicIsr (
   );
 
 /**
-  Send a SMMUV3_CMD_GENERIC command to the SMMUv3.
+  Send a single SMMUV3_CMD_GENERIC command to the SMMUv3 and wait for it to be
+  consumed. Thin wrapper over SmmuV3SendCommands for callers that only need
+  to submit one command.
 
   @param [in]  SmmuInfo  Pointer to the SMMU_INFO structure.
   @param [in]  Command   Pointer to the command to send.
@@ -496,6 +498,33 @@ EFI_STATUS
 SmmuV3SendCommand (
   IN SMMU_INFO           *SmmuInfo,
   IN SMMUV3_CMD_GENERIC  *Command
+  );
+
+/**
+  Submit a batch of SMMUv3 commands and wait once for the SMMU to drain past
+  the final command in the batch.
+
+  This is the canonical way to issue more than one command. The batch is
+  pushed to the SMMU command queue in chunks sized to the queue capacity;
+  each chunk takes one room-check + ring-write + producer-pointer publish
+  under a TPL_HIGH_LEVEL critical section. A single completion wait at the
+  end covers the entire submission because the SMMU drains commands in
+  queue order.
+
+  @param [in]  SmmuInfo      Pointer to the SMMU_INFO structure.
+  @param [in]  CommandCount  Number of commands in the batch. 0 is a no-op.
+  @param [in]  Commands      Array of CommandCount commands to submit, in
+                             order.
+
+  @retval EFI_SUCCESS            Success.
+  @retval EFI_TIMEOUT            Timeout.
+  @retval EFI_INVALID_PARAMETER  Invalid Parameters.
+**/
+EFI_STATUS
+SmmuV3SendCommands (
+  IN SMMU_INFO           *SmmuInfo,
+  IN UINT32              CommandCount,
+  IN SMMUV3_CMD_GENERIC  *Commands
   );
 
 /**
@@ -513,11 +542,17 @@ SmmuV3TLBInvalidateAll (
   );
 
 /**
-  Invalidate TLB entries for specified InputAddress for Stage 2 of SmmuV3.
+  Invalidate TLB entries for a contiguous range starting at InputAddress and
+  covering Bytes (rounded up to page granularity) for Stage 2 of SmmuV3.
+
+  Queues one CMD_TLBI_S2_IPA per page and then issues a single
+  CMD_SYNC_NO_INTERRUPT after the batch so the SMMU only drains the command
+  queue once. Use this in preference to calling per-page.
 
   @param [in]  SmmuInfo      Pointer to the SMMU_INFO structure.
   @param [in]  Vmid          The VMID to invalidate.
-  @param [in]  InputAddress  The input address to invalidate.
+  @param [in]  InputAddress  Base input address of the range.
+  @param [in]  Bytes         Range length in bytes. Must be > 0.
 
   @retval EFI_SUCCESS            Success.
   @retval EFI_TIMEOUT            Timeout.
@@ -527,7 +562,8 @@ EFI_STATUS
 SmmuV3TLBInvalidateAddress (
   IN SMMU_INFO  *SmmuInfo,
   IN UINT16     Vmid,
-  IN UINT64     InputAddress
+  IN UINT64     InputAddress,
+  IN UINT64     Bytes
   );
 
 /**

@@ -428,15 +428,17 @@ UpdatePageTable (
 
     ArmDataSynchronizationBarrier ();
 
-    if (!Valid) {
-      Status = SmmuV3TLBInvalidateAddress (SmmuInfo, Vmid, CurPhysicalAddress);
-      if (EFI_ERROR (Status)) {
-        DEBUG ((DEBUG_ERROR, "%a: Failed to invalidate TLB for address 0x%llx\n", __func__, CurPhysicalAddress));
-        goto End;
-      }
-    }
-
     CurPhysicalAddress += EFI_PAGE_SIZE;
+  }
+
+  // Batch one TLBI per page across the entire mapped range, then a single
+  // CMD_SYNC, instead of CMD_SYNC'ing per page in the loop above.
+  if (!Valid) {
+    Status = SmmuV3TLBInvalidateAddress (SmmuInfo, Vmid, PhysicalAddress, Bytes);
+    if (EFI_ERROR (Status)) {
+      DEBUG ((DEBUG_ERROR, "%a: Failed to invalidate TLB for range 0x%llx + 0x%llx\n", __func__, PhysicalAddress, Bytes));
+      goto End;
+    }
   }
 
 End:
