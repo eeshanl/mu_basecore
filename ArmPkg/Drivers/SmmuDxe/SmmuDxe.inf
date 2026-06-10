@@ -1,8 +1,8 @@
 ## @file  SmmuDxe.inf
 # Smmu Dxe driver - used to enable DMA remapping via the IoMmu.
-# This driver initializes the SmmuV3 hardware to enable stage 2 translation and DMA remapping.
+# This driver initializes the SmmuV3 hardware to enable stage 1 translation and DMA remapping.
 # The IOMMU protocol is implemented assuming a 4-level Page Table Structure.
-# The Page Table Root address is used to configure the Stream Table to enable the SMMU for stage 2 translation.
+# The Page Table Root address is installed in a per-stream Context Descriptor to enable the SMMU for stage 1 translation.
 #
 # For more info see README.md
 #

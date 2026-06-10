@@ -679,19 +679,22 @@ SmmuV3LogErrors (
       }
 
       // Dump PTE's if translation related fault. Walk the per-StreamID
-      // page-table root by reading the live STE for the faulting StreamID
-      // (S2Ttb is the source of truth).
+      // page-table root by reading the live STE for the faulting StreamID and
+      // following its Context Descriptor (S1ContextPtr -> CD -> CD.Ttb0 is the
+      // source of truth).
       if (((FaultRecord.Fault[0] & 0xFF) == 0x10) || ((FaultRecord.Fault[0] & 0xFF) == 0x11) ||
           ((FaultRecord.Fault[0] & 0xFF) == 0x12) || ((FaultRecord.Fault[0] & 0xFF) == 0x13))
       {
         UINT32                     FaultStreamId;
         PAGE_TABLE                 *FaultRoot;
+        SMMUV3_CONTEXT_DESCRIPTOR  *FaultCd;
         SMMUV3_STRTAB_BASE         StrTabBaseReg;
         VOID                       *HwStreamTableBase;
         SMMUV3_STREAM_TABLE_ENTRY  *SteSlot;
 
         FaultStreamId     = FaultRecord.Translation.StreamId;
         FaultRoot         = NULL;
+        FaultCd           = NULL;
         HwStreamTableBase = NULL;
 
         // Read back SMMU_STRTAB_BASE from hardware and compare its decoded
@@ -717,19 +720,24 @@ SmmuV3LogErrors (
         }
 
         OldTpl = gBS->RaiseTPL (TPL_HIGH_LEVEL);
-        // Dump the currently active STE fields for this StreamID and use
-        // its S2Ttb to walk the page table.
+        // Dump the currently active STE fields for this StreamID and follow
+        // its Context Descriptor to walk the page table.
         SteSlot = SmmuV3GetSteSlot (SmmuInfo, FaultStreamId);
         if (SteSlot != NULL) {
-          FaultRoot = (PAGE_TABLE *)(UINTN)((UINT64)SteSlot->S2Ttb << SMMUV3_STREAM_TABLE_ENTRY_S2TTB_OFFSET);
+          FaultCd = (SMMUV3_CONTEXT_DESCRIPTOR *)(UINTN)((UINT64)SteSlot->S1ContextPtr << SMMUV3_STREAM_TABLE_ENTRY_S1CONTEXTPTR_OFFSET);
+          if (FaultCd != NULL) {
+            FaultRoot = (PAGE_TABLE *)(UINTN)((UINT64)FaultCd->Ttb0 << SMMUV3_CONTEXT_DESCRIPTOR_TTB0_OFFSET);
+          }
+
           DEBUG ((
             DEBUG_ERROR,
-            "%a: Active STE for StreamId=0x%x: Valid=%u Config=0x%x S2Ttb=0x%llx Root=%p\n",
+            "%a: Active STE for StreamId=0x%x: Valid=%u Config=0x%x S1ContextPtr=0x%llx Cd=%p Root=%p\n",
             __func__,
             FaultStreamId,
             SteSlot->Valid,
             SteSlot->Config,
-            SteSlot->S2Ttb,
+            SteSlot->S1ContextPtr,
+            FaultCd,
             FaultRoot
             ));
         } else {
@@ -1079,10 +1087,10 @@ SmmuV3SendCommand (
 
 /**
   Invalidate all TLB entries in the SMMUv3.
-  Uses CMD_TLBI_S12_VMALL to invalidate all Stage 2 TLB entries for the specified VMID.
+  Uses CMD_TLBI_NH_ASID to invalidate all Stage 1 TLB entries for the specified ASID.
 
   @param [in]  SmmuInfo  Pointer to the SMMU_INFO structure.
-  @param [in]  Vmid      The VMID to invalidate.
+  @param [in]  Asid      The ASID to invalidate.
 
   @retval EFI_SUCCESS            Success.
   @retval EFI_TIMEOUT            Timeout.
@@ -1091,13 +1099,13 @@ SmmuV3SendCommand (
 EFI_STATUS
 SmmuV3TLBInvalidateAll (
   IN SMMU_INFO  *SmmuInfo,
-  IN UINT16     Vmid
+  IN UINT16     Asid
   )
 {
   SMMUV3_CMD_GENERIC  Command;
   EFI_STATUS          Status;
 
-  if ((SmmuInfo == NULL) || (Vmid == 0)) {
+  if ((SmmuInfo == NULL) || (Asid == 0)) {
     DEBUG ((DEBUG_ERROR, "%a: Invalid Parameters\n", __func__));
     return EFI_INVALID_PARAMETER;
   }
@@ -1105,11 +1113,12 @@ SmmuV3TLBInvalidateAll (
   // DSB before invalidating TLBs
   ArmDataSynchronizationBarrier ();
 
-  // Invalidate TLBI Command by Vmid
-  SMMUV3_BUILD_CMD_TLBI_S12_VMALL (&Command, Vmid);
+  // Invalidate Stage 1 TLBI entries by ASID. Stage 2 is bypassed, so the
+  // VMID is 0 (the stage-1-only translation regime).
+  SMMUV3_BUILD_CMD_TLBI_NH_ASID (&Command, 0, Asid);
   Status = SmmuV3SendCommand (SmmuInfo, &Command);
   if (EFI_ERROR (Status)) {
-    DEBUG ((DEBUG_ERROR, "%a: CMD_TLBI_S12_VMALL failed for Vmid 0x%llx.\n", __func__, Vmid));
+    DEBUG ((DEBUG_ERROR, "%a: CMD_TLBI_NH_ASID failed for Asid 0x%llx.\n", __func__, Asid));
     return Status;
   }
 
@@ -1128,10 +1137,10 @@ SmmuV3TLBInvalidateAll (
 }
 
 /**
-  Invalidate TLB entries for specified InputAddress for Stage 2 of SmmuV3.
+  Invalidate TLB entries for specified InputAddress for Stage 1 of SmmuV3.
 
   @param [in]  SmmuInfo      Pointer to the SMMU_INFO structure.
-  @param [in]  Vmid          The VMID to invalidate.
+  @param [in]  Asid          The ASID to invalidate.
   @param [in]  InputAddress  The input address to invalidate.
 
   @retval EFI_SUCCESS            Success.
@@ -1141,24 +1150,25 @@ SmmuV3TLBInvalidateAll (
 EFI_STATUS
 SmmuV3TLBInvalidateAddress (
   IN SMMU_INFO  *SmmuInfo,
-  IN UINT16     Vmid,
+  IN UINT16     Asid,
   IN UINT64     InputAddress
   )
 {
   SMMUV3_CMD_GENERIC  Command;
   EFI_STATUS          Status;
 
-  if ((SmmuInfo == NULL) || (Vmid == 0)) {
+  if ((SmmuInfo == NULL) || (Asid == 0)) {
     DEBUG ((DEBUG_ERROR, "%a: Invalid Parameters\n", __func__));
     return EFI_INVALID_PARAMETER;
   }
 
-  // Invalidate the per-stream {VMID, IPA} entry. Vmid was allocated for
-  // this StreamID by SmmuV3StreamGetOrCreate.
-  SMMUV3_BUILD_CMD_TLBI_S2_IPA (&Command, Vmid, InputAddress);
+  // Invalidate the per-stream {ASID, VA} entry. Asid was allocated for
+  // this StreamID by SmmuV3StreamGetOrCreate. Stage 2 is bypassed, so the
+  // VMID is 0 (the stage-1-only translation regime).
+  SMMUV3_BUILD_CMD_TLBI_NH_VA (&Command, 0, Asid, InputAddress);
   Status = SmmuV3SendCommand (SmmuInfo, &Command);
   if (EFI_ERROR (Status)) {
-    DEBUG ((DEBUG_ERROR, "%a: CMD_TLBI_S2_IPA failed.\n", __func__));
+    DEBUG ((DEBUG_ERROR, "%a: CMD_TLBI_NH_VA failed.\n", __func__));
     return Status;
   }
 
@@ -1503,10 +1513,10 @@ SmmuV3GetRMRNodeInfo (
  *
  * For every RMR node attached to this SMMU, walk its IdMappings to discover
  * the StreamIDs the reserved memory range applies to. For each such StreamID
- * we ensure a per-stream stage-2 page-table root exists (allocating it and
- * promoting the STE out of abort if needed via
+ * we ensure a per-stream stage-1 page-table root + Context Descriptor exists
+ * (allocating it and promoting the STE out of abort if needed via
  * SmmuV3StreamGetOrCreate), then identity-map the RMR ranges into
- * that per-stream root using its allocated VMID.
+ * that per-stream root using its allocated ASID.
  *
  * Must be called AFTER SmmuV3Configure has finished initializing the
  * stream table for this SMMU.
@@ -1529,7 +1539,7 @@ SmmuV3AddRMRMapping (
   UINT32                                    IdInRange;
   UINT32                                    StreamId;
   PAGE_TABLE                                *Root;
-  UINT16                                    Vmid;
+  UINT16                                    Asid;
   LIST_ENTRY                                *Entry;
   RMR_NODE_INFO                             *Item;
   EFI_STATUS                                Status;
@@ -1557,8 +1567,8 @@ SmmuV3AddRMRMapping (
 
         // Allocate/promote a per-stream page-table root for this StreamID.
         Root   = NULL;
-        Vmid   = 0;
-        Status = SmmuV3StreamGetOrCreate (SmmuInfo, StreamId, &Root, &Vmid);
+        Asid   = 0;
+        Status = SmmuV3StreamGetOrCreate (SmmuInfo, StreamId, &Root, &Asid, NULL);
         if (EFI_ERROR (Status)) {
           DEBUG ((
             DEBUG_ERROR,
@@ -1579,21 +1589,21 @@ SmmuV3AddRMRMapping (
           SmmuInfo->EBSBehaviorAbort = FALSE; // At least one RMR mapping exists, set EBS behavior to bypass
           DEBUG ((
             DEBUG_INFO,
-            "%a: Adding RMR mapping for SMMU[0x%llx] StreamId=0x%x Vmid=0x%x: Base=0x%llx, Length=0x%llx\n",
+            "%a: Adding RMR mapping for SMMU[0x%llx] StreamId=0x%x Asid=0x%x: Base=0x%llx, Length=0x%llx\n",
             __func__,
             SmmuInfo->SmmuBase,
             StreamId,
-            Vmid,
+            Asid,
             IortMemRangeDesc[NumMemRangeDesc].Base,
             IortMemRangeDesc[NumMemRangeDesc].Length
             ));
           Status = UpdatePageTable (
                      SmmuInfo,
                      Root,
-                     Vmid,
+                     Asid,
                      IortMemRangeDesc[NumMemRangeDesc].Base,
                      IortMemRangeDesc[NumMemRangeDesc].Length,
-                     PAGE_TABLE_READ_WRITE_FROM_IOMMU_ACCESS ((EDKII_IOMMU_ACCESS_READ | EDKII_IOMMU_ACCESS_WRITE)),
+                     PAGE_TABLE_S1_LEAF_RW_FLAGS,
                      TRUE
                      );
           if (EFI_ERROR (Status)) {
@@ -1986,7 +1996,7 @@ ResolveNonDiscoverableStreamId (
         //
         // For a Named Component every output StreamID in the union of all
         // mappings is one this device can present at the SMMU, so they all
-        // must share the primary's stage-2 page-table + VMID.
+        // must share the primary's stage-1 page-table + ASID.
         //
         TotalCount      = 0;
         PrimaryStreamId = 0;

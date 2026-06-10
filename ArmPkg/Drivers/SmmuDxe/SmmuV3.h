@@ -129,10 +129,32 @@
 #define SMMUV3_STREAM_TABLE_ENTRY_VALID                                    1     // Entry is valid
 
 //
-// VMID 0 is not a valid VMID so whenever we wrap past the max VMID, we set it to 0 to mark exhaustion.
-// (Applies to both 8/16-bit VMID width).
+// SMMUV3 Stage 1 Stream Table Entry / Context Descriptor bit definitions.
+// The driver programs every stream for Stage 1 translation with Stage 2
+// bypassed. The STE points at a per-stream Context Descriptor (CD) that holds
+// the Stage 1 page-table root (Ttb0) and the per-stream ASID.
 //
-#define SMMU_VMID_RESERVED  0
+#define SMMUV3_STREAM_TABLE_ENTRY_CONFIG_STAGE_1_TRANSLATE_STAGE_2_BYPASS  0x5   // Stage 1 Translate, Stage 2 Bypass
+#define SMMUV3_STREAM_TABLE_ENTRY_S1FMT_LINEAR                            0     // Single / linear Context Descriptor format
+#define SMMUV3_STREAM_TABLE_ENTRY_S1CDMAX_SINGLE                          0     // Single Context Descriptor (no substreams)
+#define SMMUV3_STREAM_TABLE_ENTRY_S1DSS_SSID0                             0     // Non-substream transactions translated by CD 0
+#define SMMUV3_STREAM_TABLE_ENTRY_S1CONTEXTPTR_OFFSET                     6     // S1ContextPtr holds the CD address >> 6
+#define SMMUV3_STREAM_TABLE_ENTRY_S1STALLD_TERMINATE                      1     // Stage 1 faults terminate (no stall)
+
+#define SMMUV3_CONTEXT_DESCRIPTOR_AA64                                    1     // AArch64 translation table format
+#define SMMUV3_CONTEXT_DESCRIPTOR_TG0_4KB                                 0     // TTB0 granule size 4KB
+#define SMMUV3_CONTEXT_DESCRIPTOR_TG1_4KB                                 2     // TTB1 granule size 4KB (TTB1 disabled via Epd1)
+#define SMMUV3_CONTEXT_DESCRIPTOR_EPD1_DISABLE                            1     // Disable TTB1 table walks (only TTB0 is used)
+#define SMMUV3_CONTEXT_DESCRIPTOR_ARS_RECORD_FAULTS                       6     // Abort transaction, record faults
+#define SMMUV3_CONTEXT_DESCRIPTOR_TTB0_OFFSET                             4     // Ttb0 holds the page-table root address >> 4
+#define SMMUV3_CONTEXT_DESCRIPTOR_MAIR_ATTR0_NORMAL_WB                     0xFF  // Attr0: Normal Inner+Outer WB cacheable, RW-allocate
+#define SMMUV3_CONTEXT_DESCRIPTOR_MAIR_ATTR0_NORMAL_NC                     0x44  // Attr0: Normal Inner+Outer Non-cacheable
+
+//
+// ASID 0 is reserved as "unassigned" so whenever we wrap past the max ASID, we
+// set it to 0 to mark exhaustion. (Applies to both 8/16-bit ASID width).
+//
+#define SMMU_ASID_RESERVED  0
 
 //
 // SMMUV3 Configuration bit definitions
@@ -203,8 +225,8 @@ typedef struct _SMMU_INFO {
   BOOLEAN       EBSBehaviorAbort;
   BOOLEAN       Enabled;
   BOOLEAN       TwoLevelStreamTableSupported; // Whether the SMMU supports 2-level stream tables, which allows more entries than can fit in a single page.
-  BOOLEAN       Vmid16Supported;              // IDR0.VMID16. FALSE = 8-bit VMIDs only.
-  UINT16        NextVmid;                     // Next per-stream VMID to hand out. Starts at 1.
+  BOOLEAN       Asid16Supported;              // IDR0.ASID16. FALSE = 8-bit ASIDs only.
+  UINT16        NextAsid;                     // Next per-stream ASID to hand out. Starts at 1.
   UINTN         EvtqIrqNum;
   UINTN         GerrIrqNum;
 } SMMU_INFO;
@@ -501,10 +523,10 @@ SmmuV3SendCommand (
 
 /**
   Invalidate all TLB entries in the SMMUv3.
-  Uses CMD_TLBI_S12_VMALL to invalidate all Stage 2 TLB entries for the specified VMID.
+  Uses CMD_TLBI_NH_ASID to invalidate all Stage 1 TLB entries for the specified ASID.
 
   @param [in]  SmmuInfo  Pointer to the SMMU_INFO structure.
-  @param [in]  Vmid      The VMID to invalidate.
+  @param [in]  Asid      The ASID to invalidate.
 
   @retval EFI_SUCCESS            Success.
   @retval EFI_TIMEOUT            Timeout.
@@ -513,14 +535,14 @@ SmmuV3SendCommand (
 EFI_STATUS
 SmmuV3TLBInvalidateAll (
   IN SMMU_INFO  *SmmuInfo,
-  IN UINT16     Vmid
+  IN UINT16     Asid
   );
 
 /**
-  Invalidate TLB entries for specified InputAddress for Stage 2 of SmmuV3.
+  Invalidate TLB entries for specified InputAddress for Stage 1 of SmmuV3.
 
   @param [in]  SmmuInfo      Pointer to the SMMU_INFO structure.
-  @param [in]  Vmid          The VMID to invalidate.
+  @param [in]  Asid          The ASID to invalidate.
   @param [in]  InputAddress  The input address to invalidate.
 
   @retval EFI_SUCCESS            Success.
@@ -530,7 +552,7 @@ SmmuV3TLBInvalidateAll (
 EFI_STATUS
 SmmuV3TLBInvalidateAddress (
   IN SMMU_INFO  *SmmuInfo,
-  IN UINT16     Vmid,
+  IN UINT16     Asid,
   IN UINT64     InputAddress
   );
 
@@ -571,9 +593,9 @@ SmmuV3ParseIort (
   );
 
 /**
-  Allocate a stage-2 page table root suitable for use as an STE's S2TTB.
-  Allocates the maximum concatenated-root size so it can be used regardless
-  of the SMMU's configured starting level / OAS.
+  Allocate a stage-1 page table root suitable for use as a Context
+  Descriptor's TTB0. Allocates the maximum concatenated-root size so it can be
+  used regardless of the SMMU's configured starting level / OAS.
 
   @retval Pointer to the zeroed root, or NULL on failure.
 **/
@@ -583,7 +605,7 @@ SmmuV3AllocatePageTableRoot (
   );
 
 /**
-  Recursively free a stage-2 page table tree previously returned by
+  Recursively free a stage-1 page table tree previously returned by
   SmmuV3AllocatePageTableRoot().
 
   @param [in]  Level      Current level (caller must pass 0 for the root).
@@ -596,28 +618,31 @@ SmmuV3FreePageTableTree (
   );
 
 /**
-  Ensure a stage-2 page-table root exists for the given StreamID. If this is
-  the first call for the StreamID on this SMMU, allocate a fresh root + VMID
-  and promote the corresponding STE from ABORT to STAGE_2_TRANSLATE using a
-  break-before-make sequence (CFGI_STE + CMD_SYNC twice). Subsequent calls
-  return the (Root, Vmid) already encoded in the live STE.
+  Ensure a stage-1 page-table root + Context Descriptor exist for the given
+  StreamID. If this is the first call for the StreamID on this SMMU, allocate a
+  fresh root + ASID + Context Descriptor and promote the corresponding STE from
+  ABORT to STAGE_1_TRANSLATE using a break-before-make sequence (CFGI_STE +
+  CMD_SYNC twice). Subsequent calls return the (Root, Asid, Cd) already encoded
+  in the live STE / Context Descriptor.
 
   @param [in]   SmmuInfo  Pointer to the SMMU_INFO structure.
   @param [in]   StreamId  The StreamID.
-  @param [out]  OutRoot   Receives the stage-2 page-table root.
-  @param [out]  OutVmid   Receives the VMID tag installed in the STE.
+  @param [out]  OutRoot   Receives the stage-1 page-table root.
+  @param [out]  OutAsid   Receives the ASID tag installed in the Context Descriptor.
+  @param [out]  OutCd     Optional. Receives the Context Descriptor pointer.
 
   @retval EFI_SUCCESS            Success.
   @retval EFI_INVALID_PARAMETER  Invalid parameters.
-  @retval EFI_OUT_OF_RESOURCES   Allocation failed / VMID space exhausted.
+  @retval EFI_OUT_OF_RESOURCES   Allocation failed / ASID space exhausted.
   @retval Other                  STE promotion failure.
 **/
 EFI_STATUS
 SmmuV3StreamGetOrCreate (
-  IN  SMMU_INFO   *SmmuInfo,
-  IN  UINT32      StreamId,
-  OUT PAGE_TABLE  **OutRoot,
-  OUT UINT16      *OutVmid
+  IN  SMMU_INFO                  *SmmuInfo,
+  IN  UINT32                     StreamId,
+  OUT PAGE_TABLE                 **OutRoot,
+  OUT UINT16                     *OutAsid,
+  OUT SMMUV3_CONTEXT_DESCRIPTOR  **OutCd OPTIONAL
   );
 
 /**
@@ -650,8 +675,8 @@ SmmuStreamIdListFree (
                                 On success contains one SMMU_STREAM_ID_ENTRY
                                 per resolved StreamID, in IORT order (first
                                 entry is the primary; rest are aliases that
-                                share the primary's stage-2 page table and
-                                VMID). Caller must release via
+                                share the primary's stage-1 page table and
+                                ASID). Caller must release via
                                 SmmuStreamIdListFree.
   @param[out]     SmmuBase      Optional. If non-NULL, receives the base
                                 address of the SMMUv3 node that owns these
@@ -673,9 +698,10 @@ DeviceHandleToStreamId (
 
 /**
   Build a default "abort-equivalent" stream-table entry. Equivalent to a
-  STAGE_2_TRANSLATE STE with S2Ttb = 0 — stage 2 is enabled but no
-  translations are installed, so DMA misses fault and are recorded. Used at
-  init to populate every STE slot before any device has been mapped.
+  STAGE_1_TRANSLATE STE with S1ContextPtr = 0 and Valid = 0 — the stream is
+  configured for stage 1 but has no Context Descriptor, so DMA misses fault
+  and are recorded. Used at init to populate every STE slot before any device
+  has been mapped.
 
   @param [in]   SmmuInfo     SMMU instance (needed for IDR-derived fields).
   @param [out]  StreamEntry  STE buffer to populate.
@@ -691,11 +717,55 @@ SmmuV3BuildInvalidStreamTableEntry (
   );
 
 /**
-  Build a STAGE_2_TRANSLATE stream-table entry using the given page-table root.
+  Allocate a stage-1 Context Descriptor (CD). The CD address must be 64-byte
+  aligned for the STE's S1ContextPtr field; a full page is allocated which
+  satisfies that requirement.
+
+  @retval Pointer to the zeroed Context Descriptor, or NULL on failure.
+**/
+SMMUV3_CONTEXT_DESCRIPTOR *
+SmmuV3AllocateContextDescriptor (
+  VOID
+  );
+
+/**
+  Free a Context Descriptor previously returned by
+  SmmuV3AllocateContextDescriptor().
+
+  @param [in]  Cd  The Context Descriptor to free. May be NULL.
+**/
+VOID
+SmmuV3FreeContextDescriptor (
+  IN SMMUV3_CONTEXT_DESCRIPTOR  *Cd
+  );
+
+/**
+  Build a stage-1 Context Descriptor pointing at the given page-table root and
+  tagged with the given ASID.
 
   @param [in]   SmmuInfo        Pointer to the SMMU_INFO structure.
-  @param [in]   PageTableRoot   Page-table root the STE should point at.
-  @param [in]   Vmid            VMID tag to install in the STE's S2VMID field.
+  @param [in]   PageTableRoot   Page-table root (TTB0) the CD should point at.
+  @param [in]   Asid            ASID tag to install in the CD.
+  @param [out]  Cd              Context Descriptor buffer to populate.
+
+  @retval EFI_SUCCESS            Success.
+  @retval EFI_INVALID_PARAMETER  Invalid parameters.
+**/
+EFI_STATUS
+SmmuV3BuildContextDescriptor (
+  IN  SMMU_INFO                  *SmmuInfo,
+  IN  PAGE_TABLE                 *PageTableRoot,
+  IN  UINT16                     Asid,
+  OUT SMMUV3_CONTEXT_DESCRIPTOR  *Cd
+  );
+
+/**
+  Build a STAGE_1_TRANSLATE stream-table entry pointing at the given Context
+  Descriptor.
+
+  @param [in]   SmmuInfo        Pointer to the SMMU_INFO structure.
+  @param [in]   Cd              Context Descriptor the STE should point at. NULL
+                                builds an invalid (Valid = 0) abort STE.
   @param [out]  StreamEntry     STE buffer to populate.
 
   @retval EFI_SUCCESS            Success.
@@ -704,8 +774,7 @@ SmmuV3BuildInvalidStreamTableEntry (
 EFI_STATUS
 SmmuV3BuildTranslateStreamTableEntry (
   IN  SMMU_INFO                  *SmmuInfo,
-  IN  PAGE_TABLE                 *PageTableRoot,
-  IN  UINT16                     Vmid,
+  IN  SMMUV3_CONTEXT_DESCRIPTOR  *Cd,
   OUT SMMUV3_STREAM_TABLE_ENTRY  *StreamEntry
   );
 
@@ -725,13 +794,12 @@ SmmuV3GetSteSlot (
   );
 
 /**
-  Promote the STE for StreamId from ABORT to STAGE_2_TRANSLATE with the given
-  page-table root, using the SMMU break-before-make sequence.
+  Promote the STE for StreamId from ABORT to STAGE_1_TRANSLATE pointing at the
+  given Context Descriptor, using the SMMU break-before-make sequence.
 
   @param [in]  SmmuInfo        Pointer to the SMMU_INFO structure.
   @param [in]  StreamId        The StreamID whose STE is being promoted.
-  @param [in]  Vmid            VMID tag to install in the STE's S2VMID field.
-  @param [in]  PageTableRoot   Page-table root to install in the STE.
+  @param [in]  Cd              Context Descriptor to install in the STE.
 
   @retval EFI_SUCCESS            Success.
   @retval EFI_INVALID_PARAMETER  Invalid parameters.
@@ -739,10 +807,9 @@ SmmuV3GetSteSlot (
 **/
 EFI_STATUS
 SmmuV3PromoteSteToTranslate (
-  IN SMMU_INFO   *SmmuInfo,
-  IN UINT32      StreamId,
-  IN UINT16      Vmid,
-  IN PAGE_TABLE  *PageTableRoot
+  IN SMMU_INFO                  *SmmuInfo,
+  IN UINT32                     StreamId,
+  IN SMMUV3_CONTEXT_DESCRIPTOR  *Cd
   );
 
 #endif

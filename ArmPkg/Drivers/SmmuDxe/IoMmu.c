@@ -35,110 +35,136 @@ typedef struct IOMMU_MAP_INFO {
 } IOMMU_MAP_INFO;
 
 /**
-  Decode the (PageTableRoot, Vmid) currently programmed in a Valid STAGE_2
-  STE. The STE is the single source of truth for per-stream translation
-  state; the (Root, Vmid) pair returned here is exactly what the SMMU is
-  using to translate this StreamID.
+  Decode the (PageTableRoot, Asid, Cd) currently programmed in a Valid
+  STAGE_1 STE. The STE + its Context Descriptor are the single source of
+  truth for per-stream translation state; the values returned here are
+  exactly what the SMMU is using to translate this StreamID.
 
   Caller must have already confirmed Ste->Valid != 0 (a not-yet-promoted
   STE is a normal initial state, not an error condition).
 
   @param [in]  Ste     STE slot.
-  @param [out] Root    Receives the stage-2 page-table root encoded in S2Ttb.
-  @param [out] Vmid    Receives the VMID encoded in S2Vmid.
+  @param [out] Root    Optional. Receives the page-table root from CD.Ttb0.
+  @param [out] Asid    Optional. Receives the ASID encoded in CD.Asid.
+  @param [out] Cd      Optional. Receives the Context Descriptor pointer
+                       encoded in STE.S1ContextPtr.
 
-  @retval EFI_SUCCESS            (Root, Vmid) decoded.
-  @retval EFI_INVALID_PARAMETER  Any of Ste / Root / Vmid is NULL.
+  @retval EFI_SUCCESS            Decoded successfully.
+  @retval EFI_INVALID_PARAMETER  Ste is NULL or has no Context Descriptor.
 **/
 STATIC
 EFI_STATUS
 SmmuV3DecodeSte (
   IN  SMMUV3_STREAM_TABLE_ENTRY  *Ste,
-  OUT PAGE_TABLE                 **Root,
-  OUT UINT16                     *Vmid
+  OUT PAGE_TABLE                 **Root OPTIONAL,
+  OUT UINT16                     *Asid OPTIONAL,
+  OUT SMMUV3_CONTEXT_DESCRIPTOR  **Cd   OPTIONAL
   )
 {
-  if ((Ste == NULL) || (Root == NULL) || (Vmid == NULL)) {
+  SMMUV3_CONTEXT_DESCRIPTOR  *ContextDescriptor;
+
+  if (Ste == NULL) {
     DEBUG ((DEBUG_ERROR, "%a: Invalid parameter\n", __func__));
     ASSERT (FALSE);
     return EFI_INVALID_PARAMETER;
   }
 
-  *Root = (PAGE_TABLE *)(UINTN)((UINT64)Ste->S2Ttb << SMMUV3_STREAM_TABLE_ENTRY_S2TTB_OFFSET);
-  *Vmid = (UINT16)Ste->S2Vmid;
+  ContextDescriptor = (SMMUV3_CONTEXT_DESCRIPTOR *)(UINTN)((UINT64)Ste->S1ContextPtr << SMMUV3_STREAM_TABLE_ENTRY_S1CONTEXTPTR_OFFSET);
+  if (ContextDescriptor == NULL) {
+    DEBUG ((DEBUG_ERROR, "%a: STE has no Context Descriptor\n", __func__));
+    ASSERT (FALSE);
+    return EFI_INVALID_PARAMETER;
+  }
+
+  if (Root != NULL) {
+    *Root = (PAGE_TABLE *)(UINTN)((UINT64)ContextDescriptor->Ttb0 << SMMUV3_CONTEXT_DESCRIPTOR_TTB0_OFFSET);
+  }
+
+  if (Asid != NULL) {
+    *Asid = (UINT16)ContextDescriptor->Asid;
+  }
+
+  if (Cd != NULL) {
+    *Cd = ContextDescriptor;
+  }
+
   return EFI_SUCCESS;
 }
 
 /**
-  Allocate the next per-stream VMID for SmmuInfo. VMID 0 is reserved as
-  "unassigned"; the allocator hands out 1..MaxVmid (width depends on
-  IDR0.VMID16) and never reuses a VMID within the same boot.
+  Allocate the next per-stream ASID for SmmuInfo. ASID 0 is reserved as
+  "unassigned"; the allocator hands out 1..MaxAsid (width depends on
+  IDR0.ASID16) and never reuses an ASID within the same boot.
 
   @param [in]   SmmuInfo  SMMU instance.
-  @param [out]  OutVmid   Receives the newly allocated VMID.
+  @param [out]  OutAsid   Receives the newly allocated ASID.
 
-  @retval EFI_SUCCESS            VMID allocated.
-  @retval EFI_OUT_OF_RESOURCES   VMID space exhausted.
+  @retval EFI_SUCCESS            ASID allocated.
+  @retval EFI_OUT_OF_RESOURCES   ASID space exhausted.
 **/
 STATIC
 EFI_STATUS
-SmmuV3AllocateVmid (
+SmmuV3AllocateAsid (
   IN  SMMU_INFO  *SmmuInfo,
-  OUT UINT16     *OutVmid
+  OUT UINT16     *OutAsid
   )
 {
-  UINT16  MaxVmid;
+  UINT16  MaxAsid;
 
-  MaxVmid = SmmuInfo->Vmid16Supported ? MAX_UINT16 : MAX_UINT8;
-  if (SmmuInfo->NextVmid == SMMU_VMID_RESERVED) {
+  MaxAsid = SmmuInfo->Asid16Supported ? MAX_UINT16 : MAX_UINT8;
+  if (SmmuInfo->NextAsid == SMMU_ASID_RESERVED) {
     // wrapped past the max
-    DEBUG ((DEBUG_ERROR, "%a: VMID space exhausted on SMMU 0x%llx\n", __func__, SmmuInfo->SmmuBase));
+    DEBUG ((DEBUG_ERROR, "%a: ASID space exhausted on SMMU 0x%llx\n", __func__, SmmuInfo->SmmuBase));
     ASSERT (FALSE);
     return EFI_OUT_OF_RESOURCES;
   }
 
-  *OutVmid = SmmuInfo->NextVmid;
-  if (SmmuInfo->NextVmid == MaxVmid) {
-    SmmuInfo->NextVmid = SMMU_VMID_RESERVED; // mark exhausted; next allocation will fail above
+  *OutAsid = SmmuInfo->NextAsid;
+  if (SmmuInfo->NextAsid == MaxAsid) {
+    SmmuInfo->NextAsid = SMMU_ASID_RESERVED; // mark exhausted; next allocation will fail above
   } else {
-    SmmuInfo->NextVmid++;
+    SmmuInfo->NextAsid++;
   }
 
   return EFI_SUCCESS;
 }
 
 /**
-  Ensure a stage-2 page-table root exists for the given StreamID. On first
-  call for a StreamID, allocates a fresh root + VMID and promotes the
-  corresponding STE from Invalid to a Valid STAGE_2_TRANSLATE entry using
-  break-before-make. Subsequent calls read the (Root, Vmid) back out of the
-  live STE (the single source of truth).
+  Ensure a stage-1 page-table root + Context Descriptor exist for the given
+  StreamID. On first call for a StreamID, allocates a fresh root + ASID +
+  Context Descriptor and promotes the corresponding STE from Invalid to a
+  Valid STAGE_1_TRANSLATE entry using break-before-make. Subsequent calls read
+  the (Root, Asid, Cd) back out of the live STE / Context Descriptor (the
+  single source of truth).
 
   @param [in]   SmmuInfo  SMMU instance.
   @param [in]   StreamId  StreamID.
-  @param [out]  OutRoot   Receives the stage-2 page-table root.
-  @param [out]  OutVmid   Receives the VMID tag installed in the STE.
+  @param [out]  OutRoot   Receives the stage-1 page-table root.
+  @param [out]  OutAsid   Receives the ASID tag installed in the Context Descriptor.
+  @param [out]  OutCd     Optional. Receives the Context Descriptor pointer.
 
   @retval EFI_SUCCESS            Success.
   @retval EFI_INVALID_PARAMETER  Invalid parameters.
-  @retval EFI_OUT_OF_RESOURCES   Allocation failed / VMID space exhausted.
+  @retval EFI_OUT_OF_RESOURCES   Allocation failed / ASID space exhausted.
   @retval Other                  STE promotion failure.
 **/
 EFI_STATUS
 SmmuV3StreamGetOrCreate (
-  IN  SMMU_INFO   *SmmuInfo,
-  IN  UINT32      StreamId,
-  OUT PAGE_TABLE  **OutRoot,
-  OUT UINT16      *OutVmid
+  IN  SMMU_INFO                  *SmmuInfo,
+  IN  UINT32                     StreamId,
+  OUT PAGE_TABLE                 **OutRoot,
+  OUT UINT16                     *OutAsid,
+  OUT SMMUV3_CONTEXT_DESCRIPTOR  **OutCd OPTIONAL
   )
 {
   EFI_STATUS                 Status;
   SMMUV3_STREAM_TABLE_ENTRY  *Ste;
   PAGE_TABLE                 *NewRoot;
-  UINT16                     NewVmid;
+  SMMUV3_CONTEXT_DESCRIPTOR  *NewCd;
+  UINT16                     NewAsid;
   EFI_TPL                    OldTpl;
 
-  if ((SmmuInfo == NULL) || (OutRoot == NULL) || (OutVmid == NULL)) {
+  if ((SmmuInfo == NULL) || (OutRoot == NULL) || (OutAsid == NULL)) {
     DEBUG ((DEBUG_ERROR, "%a: Invalid parameter\n", __func__));
     ASSERT (FALSE);
     return EFI_INVALID_PARAMETER;
@@ -154,9 +180,9 @@ SmmuV3StreamGetOrCreate (
     return EFI_INVALID_PARAMETER;
   }
 
-  // Already promoted -> read the (Root, Vmid) the SMMU is actively using.
+  // Already promoted -> read the (Root, Asid, Cd) the SMMU is actively using.
   if (Ste->Valid != 0) {
-    Status = SmmuV3DecodeSte (Ste, OutRoot, OutVmid);
+    Status = SmmuV3DecodeSte (Ste, OutRoot, OutAsid, OutCd);
     gBS->RestoreTPL (OldTpl);
     if (EFI_ERROR (Status)) {
       DEBUG ((DEBUG_ERROR, "%a: Failed to decode STE for SmmuBase=0x%llx StreamId 0x%x\n", __func__, SmmuInfo->SmmuBase, StreamId));
@@ -166,7 +192,7 @@ SmmuV3StreamGetOrCreate (
     return Status;
   }
 
-  Status = SmmuV3AllocateVmid (SmmuInfo, &NewVmid);
+  Status = SmmuV3AllocateAsid (SmmuInfo, &NewAsid);
   if (EFI_ERROR (Status)) {
     gBS->RestoreTPL (OldTpl);
     return Status;
@@ -180,9 +206,33 @@ SmmuV3StreamGetOrCreate (
     return EFI_OUT_OF_RESOURCES;
   }
 
-  Status = SmmuV3PromoteSteToTranslate (SmmuInfo, StreamId, NewVmid, NewRoot);
+  NewCd = SmmuV3AllocateContextDescriptor ();
+  if (NewCd == NULL) {
+    DEBUG ((DEBUG_ERROR, "%a: Failed to allocate Context Descriptor for SmmuBase=0x%llx StreamId 0x%x\n", __func__, SmmuInfo->SmmuBase, StreamId));
+    ASSERT (FALSE);
+    SmmuV3FreePageTableTree (0, NewRoot);
+    gBS->RestoreTPL (OldTpl);
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  Status = SmmuV3BuildContextDescriptor (SmmuInfo, NewRoot, NewAsid, NewCd);
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "%a: Failed to build Context Descriptor for SmmuBase=0x%llx StreamId 0x%x: %r\n", __func__, SmmuInfo->SmmuBase, StreamId, Status));
+    SmmuV3FreeContextDescriptor (NewCd);
+    SmmuV3FreePageTableTree (0, NewRoot);
+    ASSERT_EFI_ERROR (Status);
+    gBS->RestoreTPL (OldTpl);
+    return Status;
+  }
+
+  // Ensure the Context Descriptor contents are observable before the STE is
+  // published to reference it.
+  ArmDataSynchronizationBarrier ();
+
+  Status = SmmuV3PromoteSteToTranslate (SmmuInfo, StreamId, NewCd);
   if (EFI_ERROR (Status)) {
     DEBUG ((DEBUG_ERROR, "%a: Failed to promote STE for SmmuBase=0x%llx StreamId 0x%x: %r\n", __func__, SmmuInfo->SmmuBase, StreamId, Status));
+    SmmuV3FreeContextDescriptor (NewCd);
     SmmuV3FreePageTableTree (0, NewRoot);
     ASSERT_EFI_ERROR (Status);
     gBS->RestoreTPL (OldTpl);
@@ -192,46 +242,47 @@ SmmuV3StreamGetOrCreate (
   gBS->RestoreTPL (OldTpl);
 
   *OutRoot = NewRoot;
-  *OutVmid = NewVmid;
+  *OutAsid = NewAsid;
+  if (OutCd != NULL) {
+    *OutCd = NewCd;
+  }
+
   return EFI_SUCCESS;
 }
 
 /**
-  Bind a StreamID's STE to share an existing primary stream's stage-2
-  page-table root and VMID. Used when a single device exposes multiple
-  StreamIDs that must all see the same translations.
+  Bind a StreamID's STE to share an existing primary stream's stage-1 Context
+  Descriptor (and therefore its page-table root and ASID). Used when a single
+  device exposes multiple StreamIDs that must all see the same translations.
 
-  If the alias STE already encodes the same (Root, Vmid) it is a no-op.
-  Otherwise the alias STE is promoted in place to publish the shared root +
-  VMID. An alias STE that has already been promoted with a *different*
-  root is treated as a configuration error.
+  If the alias STE already points at the same Context Descriptor it is a
+  no-op. Otherwise the alias STE is promoted in place to publish the shared
+  Context Descriptor. An alias STE that has already been promoted with a
+  *different* Context Descriptor is treated as a configuration error.
 
   @param [in]  SmmuInfo       SMMU instance.
   @param [in]  AliasStreamId  StreamID that should alias the primary.
-  @param [in]  PrimaryRoot    Primary stream's page-table root (non-NULL).
-  @param [in]  PrimaryVmid    Primary stream's VMID (non-zero).
+  @param [in]  PrimaryCd      Primary stream's Context Descriptor (non-NULL).
 
   @retval EFI_SUCCESS            Alias bound.
   @retval EFI_INVALID_PARAMETER  Invalid parameters.
-  @retval EFI_ALREADY_STARTED    Alias STE already points at a different root.
+  @retval EFI_ALREADY_STARTED    Alias STE already points at a different CD.
   @retval Other                  STE-promotion failure.
 **/
 STATIC
 EFI_STATUS
 SmmuV3StreamAlias (
-  IN  SMMU_INFO   *SmmuInfo,
-  IN  UINT32      AliasStreamId,
-  IN  PAGE_TABLE  *PrimaryRoot,
-  IN  UINT16      PrimaryVmid
+  IN  SMMU_INFO                  *SmmuInfo,
+  IN  UINT32                     AliasStreamId,
+  IN  SMMUV3_CONTEXT_DESCRIPTOR  *PrimaryCd
   )
 {
   EFI_STATUS                 Status;
   SMMUV3_STREAM_TABLE_ENTRY  *AliasSte;
-  PAGE_TABLE                 *ExistingRoot;
-  UINT16                     ExistingVmid;
+  SMMUV3_CONTEXT_DESCRIPTOR  *ExistingCd;
   EFI_TPL                    OldTpl;
 
-  if ((SmmuInfo == NULL) || (PrimaryRoot == NULL) || (PrimaryVmid == 0)) {
+  if ((SmmuInfo == NULL) || (PrimaryCd == NULL)) {
     DEBUG ((DEBUG_ERROR, "%a: Invalid parameter\n", __func__));
     ASSERT (FALSE);
     return EFI_INVALID_PARAMETER;
@@ -247,40 +298,37 @@ SmmuV3StreamAlias (
     return EFI_INVALID_PARAMETER;
   }
 
-  // If the alias STE is already promoted, compare against the primary.
+  // If the alias STE is already promoted, compare against the primary CD.
   if (AliasSte->Valid != 0) {
-    Status = SmmuV3DecodeSte (AliasSte, &ExistingRoot, &ExistingVmid);
+    Status = SmmuV3DecodeSte (AliasSte, NULL, NULL, &ExistingCd);
     if (EFI_ERROR (Status)) {
       ASSERT_EFI_ERROR (Status);
       gBS->RestoreTPL (OldTpl);
       return Status;
     }
 
-    if ((ExistingRoot == PrimaryRoot) && (ExistingVmid == PrimaryVmid)) {
+    if (ExistingCd == PrimaryCd) {
       gBS->RestoreTPL (OldTpl);
       return EFI_SUCCESS;
     }
 
-    if (ExistingRoot != PrimaryRoot) {
-      DEBUG ((
-        DEBUG_ERROR,
-        "%a: StreamId 0x%x already has its own root %p; cannot alias to %p\n",
-        __func__,
-        AliasStreamId,
-        ExistingRoot,
-        PrimaryRoot
-        ));
-      ASSERT (FALSE);
-      gBS->RestoreTPL (OldTpl);
-      return EFI_ALREADY_STARTED;
-    }
+    DEBUG ((
+      DEBUG_ERROR,
+      "%a: StreamId 0x%x already has its own Context Descriptor %p; cannot alias to %p\n",
+      __func__,
+      AliasStreamId,
+      ExistingCd,
+      PrimaryCd
+      ));
+    ASSERT (FALSE);
+    gBS->RestoreTPL (OldTpl);
+    return EFI_ALREADY_STARTED;
   }
 
   Status = SmmuV3PromoteSteToTranslate (
              SmmuInfo,
              AliasStreamId,
-             PrimaryVmid,
-             PrimaryRoot
+             PrimaryCd
              );
   if (EFI_ERROR (Status)) {
     DEBUG ((
@@ -299,11 +347,10 @@ SmmuV3StreamAlias (
 
   DEBUG ((
     DEBUG_VERBOSE,
-    "%a: Aliased StreamId 0x%x (root=%p VMID=0x%x)\n",
+    "%a: Aliased StreamId 0x%x (Cd=%p)\n",
     __func__,
     AliasStreamId,
-    PrimaryRoot,
-    PrimaryVmid
+    PrimaryCd
     ));
 
   return EFI_SUCCESS;
@@ -419,7 +466,7 @@ End:
 
   @param [in]  SmmuInfo                   SMMU instance.
   @param [in]  Root                       Pointer to the root page table.
-  @param [in]  Vmid                       VMID for associated page table root.
+  @param [in]  Asid                       ASID for associated page table root.
   @param [in]  PhysicalAddress            Physical address to map.
   @param [in]  Bytes                      Number of bytes to map.
   @param [in]  Flags                      Flags to set for the mapping. 12 bits or less.
@@ -433,7 +480,7 @@ EFI_STATUS
 UpdatePageTable (
   IN SMMU_INFO   *SmmuInfo,
   IN PAGE_TABLE  *Root,
-  IN UINT16      Vmid,
+  IN UINT16      Asid,
   IN UINT64      PhysicalAddress,
   IN UINT64      Bytes,
   IN UINT16      Flags,
@@ -469,9 +516,9 @@ UpdatePageTable (
   }
 
   if (!Valid) {
-    Status = SmmuV3TLBInvalidateAll (SmmuInfo, Vmid);
+    Status = SmmuV3TLBInvalidateAll (SmmuInfo, Asid);
     if (EFI_ERROR (Status)) {
-      DEBUG ((DEBUG_ERROR, "%a: Failed to invalidate TLB for Vmid 0x%llx\n", __func__, Vmid));
+      DEBUG ((DEBUG_ERROR, "%a: Failed to invalidate TLB for Asid 0x%llx\n", __func__, Asid));
       goto End;
     }
   }
@@ -765,11 +812,11 @@ End:
 /**
   Shared back-end for IoMmuSetAttribute / IoMmuSetAttributeById.
 
-  Resolves OwningSmmuBase to an enabled SMMU instance, ensures a stage-2
-  page-table root + VMID exist for PrimaryStreamId on it, optionally aliases
-  additional StreamIDs (every node after the head of StreamIdList) to that
-  root + VMID, then updates the page table with the requested mapping /
-  permissions.
+  Resolves OwningSmmuBase to an enabled SMMU instance, ensures a stage-1
+  page-table root + ASID + Context Descriptor exist for PrimaryStreamId on it,
+  optionally aliases additional StreamIDs (every node after the head of
+  StreamIdList) to that Context Descriptor, then updates the page table with
+  the requested mapping / permissions.
 
   @param [in] OwningSmmuBase   Base MMIO address of the SMMU that owns
                                PrimaryStreamId. Resolved to an enabled
@@ -778,8 +825,8 @@ End:
                                ensured / used for the mapping update.
   @param [in] StreamIdList     OPTIONAL. Full StreamID list whose first node
                                is the primary; every subsequent node is
-                               aliased to the primary's root + VMID. Pass
-                               NULL when there are no aliases to bind.
+                               aliased to the primary's Context Descriptor.
+                               Pass NULL when there are no aliases to bind.
   @param [in] MapInfo          Mapping info from Map().
   @param [in] IoMmuAccess      R/W access bits.
 
@@ -799,13 +846,14 @@ IoMmuSetAttributeHelper (
   IN UINT64          IoMmuAccess
   )
 {
-  EFI_STATUS  Status;
-  SMMU_INFO   *TargetSmmu;
-  PAGE_TABLE  *PrimaryRoot;
-  UINT16      PrimaryVmid;
-  LIST_ENTRY  *Link;
-  UINT32      SmmuIndex;
-  UINT32      StreamIdCount;
+  EFI_STATUS                 Status;
+  SMMU_INFO                  *TargetSmmu;
+  PAGE_TABLE                 *PrimaryRoot;
+  UINT16                     PrimaryAsid;
+  SMMUV3_CONTEXT_DESCRIPTOR  *PrimaryCd;
+  LIST_ENTRY                 *Link;
+  UINT32                     SmmuIndex;
+  UINT32                     StreamIdCount;
 
   if ((MapInfo == NULL) || (OwningSmmuBase == 0)) {
     DEBUG ((DEBUG_ERROR, "%a: Invalid parameter.\n", __func__));
@@ -835,11 +883,12 @@ IoMmuSetAttributeHelper (
     return EFI_NOT_FOUND;
   }
 
-  // Ensure / allocate root + VMID for the primary StreamID.
+  // Ensure / allocate root + ASID + Context Descriptor for the primary StreamID.
   PrimaryRoot = NULL;
-  PrimaryVmid = 0;
-  Status      = SmmuV3StreamGetOrCreate (TargetSmmu, PrimaryStreamId, &PrimaryRoot, &PrimaryVmid);
-  if (EFI_ERROR (Status) || (PrimaryRoot == NULL) || (PrimaryVmid == 0)) {
+  PrimaryAsid = 0;
+  PrimaryCd   = NULL;
+  Status      = SmmuV3StreamGetOrCreate (TargetSmmu, PrimaryStreamId, &PrimaryRoot, &PrimaryAsid, &PrimaryCd);
+  if (EFI_ERROR (Status) || (PrimaryRoot == NULL) || (PrimaryAsid == 0) || (PrimaryCd == NULL)) {
     DEBUG ((
       DEBUG_ERROR,
       "%a: Failed to ensure page-table root for StreamId 0x%x on SMMU 0x%llx: %r\n",
@@ -860,7 +909,7 @@ IoMmuSetAttributeHelper (
 
   DEBUG ((
     DEBUG_VERBOSE,
-    "%a: SmmuBase=0x%llx PrimaryStreamId=0x%x IoMmuAccess=0x%llx HostAddress=0x%llx DeviceAddress=0x%llx Bytes=0x%llx Root=%p VMID=0x%x\n",
+    "%a: SmmuBase=0x%llx PrimaryStreamId=0x%x IoMmuAccess=0x%llx HostAddress=0x%llx DeviceAddress=0x%llx Bytes=0x%llx Root=%p ASID=0x%x Cd=%p\n",
     __func__,
     TargetSmmu->SmmuBase,
     PrimaryStreamId,
@@ -869,12 +918,13 @@ IoMmuSetAttributeHelper (
     MapInfo->DeviceAddress,
     (UINT64)MapInfo->NumberOfBytes,
     PrimaryRoot,
-    PrimaryVmid
+    PrimaryAsid,
+    PrimaryCd
     ));
 
   // Bind any alias StreamIDs (every node after the head of StreamIdList) to
-  // the primary's root + VMID so a single page-table update below covers DMA
-  // from all of them.
+  // the primary's Context Descriptor so a single page-table update below
+  // covers DMA from all of them.
   if ((StreamIdList != NULL) && !IsListEmpty (StreamIdList)) {
     for (Link = GetNextNode (StreamIdList, GetFirstNode (StreamIdList));
          !IsNull (StreamIdList, Link);
@@ -883,7 +933,7 @@ IoMmuSetAttributeHelper (
       SMMU_STREAM_ID_ENTRY  *AliasEntry;
 
       AliasEntry = BASE_CR (Link, SMMU_STREAM_ID_ENTRY, Link);
-      Status     = SmmuV3StreamAlias (TargetSmmu, AliasEntry->StreamId, PrimaryRoot, PrimaryVmid);
+      Status     = SmmuV3StreamAlias (TargetSmmu, AliasEntry->StreamId, PrimaryCd);
       if (EFI_ERROR (Status)) {
         DEBUG ((
           DEBUG_ERROR,
@@ -911,10 +961,10 @@ IoMmuSetAttributeHelper (
   Status = UpdatePageTable (
              TargetSmmu,
              PrimaryRoot,
-             PrimaryVmid,
+             PrimaryAsid,
              MapInfo->DeviceAddress,
              MapInfo->NumberOfBytes,
-             PAGE_TABLE_READ_WRITE_FROM_IOMMU_ACCESS ((EDKII_IOMMU_ACCESS_READ | EDKII_IOMMU_ACCESS_WRITE)), // TODO: https://github.com/microsoft/mu_silicon_arm_tiano/issues/375 debug issue on physical platform and revert the permissions
+             PAGE_TABLE_S1_LEAF_RW_FLAGS, // TODO: https://github.com/microsoft/mu_silicon_arm_tiano/issues/375 debug issue on physical platform and revert the permissions
              (IoMmuAccess != 0)
              );
   if (EFI_ERROR (Status)) {
@@ -969,11 +1019,12 @@ IoMmuSetAttribute (
   //      RC ID-mapping's OutputReference, or the platform NC table for
   //      NonDiscoverable devices).
   //   2. Locate the SMMU_INFO whose SmmuBase matches.
-  //   3. Ensure the *primary* StreamID has a per-stream stage-2 page-table
-  //      root on that SMMU (allocates + promotes the STE on first call).
+  //   3. Ensure the *primary* StreamID has a per-stream stage-1 page-table
+  //      root + Context Descriptor on that SMMU (allocates + promotes the STE
+  //      on first call).
   //   4. For any additional StreamIDs reported for this device, alias them
-  //      to share the primary's root + VMID so a single page-table update
-  //      covers all of them.
+  //      to share the primary's Context Descriptor so a single page-table
+  //      update covers all of them.
   //   5. Update that shared root once with the requested mapping /
   //      permissions.
   //
