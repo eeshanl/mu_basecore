@@ -23,5 +23,5 @@
 [Protocols]
   gEdkiiIoMmuProtocolGuid             ## CONSUMES
 
-[Depex.AARCH64]
+[Depex]
   gEdkiiIoMmuProtocolGuid             ## CONSUMES

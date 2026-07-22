@@ -14,8 +14,6 @@
 #include <Library/UefiLib.h>
 #include <Protocol/IoMmu.h>
 
-EFI_EVENT             mIoMmuEvent;
-VOID                  *mIoMmuRegistration;
 EDKII_IOMMU_PROTOCOL  *mIoMmuProtocol = NULL;
 
 // TRUE only when the located IoMmu producer is at a revision that includes
@@ -221,34 +219,10 @@ IoMmuSetAttributeById (
 }
 
 /**
-  Event notification that is fired when IOMMU protocol is installed.
-
-  @param [in] Event               The Event that is being processed.
-  @param [in] Context             Event Context.
-
-**/
-VOID
-IoMmuProtocolCallback (
-  IN  EFI_EVENT  Event,
-  IN  VOID       *Context
-  )
-{
-  EFI_STATUS  Status;
-
-  Status = gBS->LocateProtocol (&gEdkiiIoMmuProtocolGuid, NULL, (VOID **)&mIoMmuProtocol);
-  if (!EFI_ERROR (Status)) {
-    mSetAttributeByIdSupported = ((mIoMmuProtocol != NULL) &&
-                                  (mIoMmuProtocol->Revision >= EDKII_IOMMU_PROTOCOL_REVISION) &&
-                                  (mIoMmuProtocol->SetAttributeById != NULL)
-                                  );
-    gBS->CloseEvent (mIoMmuEvent);
-  }
-}
-
-/**
  * IoMmuLibInit Constructor
- * Locates the IoMmu protocol and initializes the library.
- * If the IoMmu protocol is not found, it sets up a notification event to be called when the protocol is installed.
+ * Locates the IoMmu protocol and initializes the library. The library's INF
+ * declares a DEPEX on gEdkiiIoMmuProtocolGuid, so the protocol is guaranteed
+ * to be available by the time this constructor runs.
  *
  * @retval EFI_SUCCESS           A protocol instance matching Protocol was found and returned in
  *                               Interface.
@@ -268,42 +242,19 @@ IoMmuLibInit (
 
   Status = gBS->LocateProtocol (&gEdkiiIoMmuProtocolGuid, NULL, (VOID **)&mIoMmuProtocol);
   if (EFI_ERROR (Status)) {
-    DEBUG ((DEBUG_ERROR, "%a: IoMmuProtocol not found, setting IoMmuProtocolCallback\n", __func__));
-
-    Status = gBS->CreateEvent (
-                    EVT_NOTIFY_SIGNAL,
-                    (EFI_TPL)TPL_CALLBACK,
-                    (EFI_EVENT_NOTIFY)IoMmuProtocolCallback,
-                    NULL,
-                    &mIoMmuEvent
-                    );
-    if (EFI_ERROR (Status)) {
-      DEBUG ((DEBUG_ERROR, "%a: Failed to create IoMmuProtocolCallback event\n", __func__));
-      ASSERT_EFI_ERROR (Status);
-      return Status;
-    }
-
-    // Register for gEdkiiIoMmuProtocolGuid notifications on this event
-    Status = gBS->RegisterProtocolNotify (
-                    &gEdkiiIoMmuProtocolGuid,
-                    mIoMmuEvent,
-                    &mIoMmuRegistration
-                    );
-    if (EFI_ERROR (Status)) {
-      DEBUG ((DEBUG_ERROR, "%a: Failed to register IoMmuProtocol notify\n", __func__));
-      ASSERT_EFI_ERROR (Status);
-      gBS->CloseEvent (mIoMmuEvent);
-    }
-
-    return EFI_SUCCESS;
+    DEBUG ((DEBUG_ERROR, "%a: IoMmuProtocol not found despite DEPEX. Status = %r\n", __func__, Status));
+    ASSERT_EFI_ERROR (Status);
+    return Status;
   }
 
   // The library remains fully functional with older IoMmu revisions.
   // If revision < EDKII_IOMMU_PROTOCOL_REVISION, then
   // IoMmuSetAttributeById will return EFI_UNSUPPORTED
-  if ((mIoMmuProtocol != NULL) && (mIoMmuProtocol->Revision >= EDKII_IOMMU_PROTOCOL_REVISION) && (mIoMmuProtocol->SetAttributeById != NULL)) {
-    mSetAttributeByIdSupported = TRUE;
-  } else {
+  mSetAttributeByIdSupported = ((mIoMmuProtocol != NULL) &&
+                                (mIoMmuProtocol->Revision >= EDKII_IOMMU_PROTOCOL_REVISION) &&
+                                (mIoMmuProtocol->SetAttributeById != NULL)
+                                );
+  if (!mSetAttributeByIdSupported) {
     DEBUG ((
       DEBUG_WARN,
       "%a: IoMmuProtocol revision 0x%llx does not support SetAttributeById. IoMmuSetAttributeById will return EFI_UNSUPPORTED.\n",
