@@ -7,11 +7,12 @@ translation and memory protection for DMA operations.
 ## Architecture Overview
 
 The SmmuDxe driver will consume the SMMU_CONFIG HOB with the IORT data to configure the SMMUs found on the platform.
-It will set them up for Stage 2 Translation by default. SmmuDxe will install the IoMmu Protocol.
-Translation table mapping can be done by leveraging the IoMmu Protocol. The protocol functions are outlined below.
-Seperatley, an IoMmuLib is provided for platforms to use as an abstraction for locating and using the IoMmu protocol.
-SmmuDxe will install the IORT ACPI Table. Platform should not install the IORT, but instead pass in the IORT data
-with the SMMU_CONFIG HOB.
+It will set them up for Stage 2 Translation by default, or Stage 1 Translation when the platform explicitly opts in
+via `SMMU_CONFIG->TranslationStage` (see [Translation Stage](#translation-stage)). SmmuDxe will install the IoMmu
+Protocol. Translation table mapping can be done by leveraging the IoMmu Protocol. The protocol functions are outlined
+below. Seperatley, an IoMmuLib is provided for platforms to use as an abstraction for locating and using the IoMmu
+protocol. SmmuDxe will install the IORT ACPI Table. Platform should not install the IORT, but instead pass in the
+IORT data with the SMMU_CONFIG HOB.
 
 The system consists of four main components working together:
 
@@ -210,9 +211,10 @@ For direct mappings (no bounce buffer), only the mapping information structure i
    3. `DeviceHandleToStreamId` uses `Seg` to dispatch: real PCIe goes through the IORT Root-Complex ID-mapping path,
       Segment `0xFF` goes through the NonDiscoverable lookup table + IORT Named Component path
       (see [Per-StreamID Isolation](#per-streamid-isolation)).
-   4. The resolved primary StreamID's stage-2 page-table root and VMID are then used to actually
-      install / invalidate the mapping for `MapInfo->DeviceAddress` with the requested `IoMmuAccess` permissions
-      (or to tear it down when `IoMmuAccess == 0`).
+   4. The resolved primary StreamID's per-stream page-table root and tag (VMID on Stage 2, or ASID inside a
+      Context Descriptor on Stage 1) are then used to actually install / invalidate the mapping for
+      `MapInfo->DeviceAddress` with the requested `IoMmuAccess` permissions (or to tear it down when
+      `IoMmuAccess == 0`).
 
    This is also why the controller handle had to be plumbed through `NonDiscoverablePciDeviceDxe` - its
    `PciIoMap`/`PciIoUnmap` now pass `Dev->Handle` to `IoMmuSetAttribute` instead of the old `NULL`, so SmmuDxe can do
@@ -258,8 +260,10 @@ For direct mappings (no bounce buffer), only the mapping information structure i
 
 ## Per-StreamID Isolation
 
-Each DMA-capable device gets its own stage-2 page-table root and VMID. Mappings made for one device are **not**
-visible to any other device. Conceptually, on every `IoMmuSetAttribute` / `IoMmuSetAttributeById` call the driver:
+Each DMA-capable device gets its own per-stream page-table root and per-stream tag. For Stage 2 the tag is a
+**VMID** encoded directly in the STE; for Stage 1 the tag is an **ASID** stored in a per-stream Context Descriptor
+(CD) whose address the STE's `S1ContextPtr` field points at. Mappings made for one device are **not** visible to
+any other device. Conceptually, on every `IoMmuSetAttribute` / `IoMmuSetAttributeById` call the driver:
 
 1. Resolves the caller (device handle, or a caller-supplied `(IommuBase, DmaId)` for the handle-less path) to:
    - One or more StreamIDs.
@@ -268,33 +272,44 @@ visible to any other device. Conceptually, on every `IoMmuSetAttribute` / `IoMmu
    For handle-aware callers this resolution walks the platform IORT (and the optional NonDiscoverable lookup table -
    see [Non-Discoverable Device Integration](#non-discoverable-device-integration)).
 2. Selects the matching SMMU instance by that base address.
-3. For the **primary** (first) StreamID, lazily allocates a stage-2 page-table root and a VMID on demand and
-   promotes the Stream Table Entry (STE) from `INVALID` to `STAGE_2_TRANSLATE` using break-before-make.
-4. Aliases every additional StreamID reported for the same device onto the primary's root and VMID (its STE is
-   promoted to point at the same root). A single page-table update therefore covers DMA from all StreamIDs that
-   belong to one logical device.
+3. For the **primary** (first) StreamID, lazily allocates a per-stream page-table root plus:
+   - **Stage 2:** a VMID, then promotes the Stream Table Entry (STE) from `INVALID` to `STAGE_2_TRANSLATE`
+     (break-before-make).
+   - **Stage 1:** a Context Descriptor plus an ASID (the CD's `Ttb0` points at the root, `Asid` holds the tag),
+     then promotes the STE from `INVALID` to `STAGE_1_TRANSLATE / STAGE_2_BYPASS` with `S1ContextPtr` pointing at
+     the CD.
+4. Aliases every additional StreamID reported for the same device onto the primary's per-stream state:
+   - **Stage 2:** the alias STE is promoted to carry the same `S2Ttb + S2VMID` as the primary.
+   - **Stage 1:** the alias STE is promoted to point at the **same CD** as the primary via `S1ContextPtr`, so all
+     aliases share the same ASID + Stage 1 root.
+
+   A single page-table update therefore covers DMA from all StreamIDs that belong to one logical device.
 5. Updates the page table with the requested permissions (or tears the mapping down when permissions are cleared).
 
-### Page table root (S2TTB) and VMID
+### Page table root and per-stream tag
 
-Stage-2 page tables on the SMMU are tagged by VMID. The SMMU caches TLB entries keyed by `(VMID, IPA)`, and the STE
-for a StreamID carries an `S2VMID` field that selects which page tables the SMMU walks for that stream. Two streams
-with two different page-table roots **must** have two different VMIDs.
+Per-stream page tables on the SMMU are tagged by VMID (Stage 2) or ASID (Stage 1). The SMMU caches TLB entries
+keyed by that tag, and the STE (Stage 2) or CD (Stage 1) carries the tag field that selects which page tables the
+SMMU walks for that stream. Two streams with two different page-table roots **must** have two different tags.
 
-Each page-table root therefore needs its own VMID. Each STE gets a unique VMID unless the driver explicitly wants
-to share that STE's page-table root with another stream (the alias case below):
+Each page-table root therefore needs its own tag. Each per-stream context gets a unique tag unless the driver
+explicitly wants to share that root with another stream (the alias case below):
 
-- The STE itself is the single source of truth for the `(Root, Vmid)` binding. On the first mapping for a StreamID
-  a fresh VMID and root are allocated and the STE is promoted; on subsequent mappings the existing binding is read
-  back from the live STE's `S2Ttb` / `S2Vmid` fields. VMID `0` is reserved as "unassigned".
-- VMID width comes from the SMMU's `IDR0.VMID16` capability: 8-bit SMMUs use values `1..0xFF`, 16-bit SMMUs use
-  `1..0xFFFF`. A VMID is never reused for a different root within the same boot.
-- Aliasing does the inverse: given the **primary's** `(Root, Vmid)`, the alias STE is promoted in place to point
-  at the same root with the same `S2VMID`. If the alias STE already encodes the same `(Root, Vmid)` this is a
-  no-op. That's how multiple StreamIDs share one mapping - they all resolve through the same VMID tag, so a
-  single TLB invalidation by `(VMID, IPA)` covers every alias.
-- On unmap the driver invalidates by VMID. Because the VMID is unique per page-table root, that invalidation can't
-  accidentally evict another device's translations.
+- **Stage 2**: The STE itself is the single source of truth for the `(Root, Vmid)` binding. On the first mapping
+  for a StreamID a fresh VMID and root are allocated and the STE is promoted; on subsequent mappings the existing
+  binding is read back from the live STE's `S2Ttb` / `S2Vmid` fields. VMID `0` is reserved as "unassigned".
+- **Stage 1**: The STE + CD together are the source of truth. `S1ContextPtr` locates the CD; the CD's `Ttb0` /
+  `Asid` fields hold the root pointer and the ASID tag. ASID `0` is reserved as "unassigned". Per SMMUv3.2 §5.2,
+  when only Stage 1 is enabled the STE's `S2VMID` field is ignored and Stage 1 TLB entries are tagged with
+  VMID = 0; TLB invalidation uses `CMD_TLBI_NH_ASID` with VMID = 0.
+- Tag width comes from the SMMU's `IDR0.VMID16` (Stage 2) or `IDR0.ASID16` (Stage 1) capability: 8-bit SMMUs use
+  values `1..0xFF`, 16-bit SMMUs use `1..0xFFFF`. A tag is never reused for a different root within the same boot.
+- Aliasing does the inverse: given the **primary's** state, the alias STE is promoted in place to reference the
+  same state (same `S2Ttb + S2VMID` on Stage 2, same `S1ContextPtr` on Stage 1). If the alias STE already encodes
+  the same state this is a no-op. That's how multiple StreamIDs share one mapping - they all resolve through the
+  same tag, so a single TLB invalidation covers every alias.
+- On unmap the driver invalidates by VMID (Stage 2) or ASID (Stage 1). Because the tag is unique per page-table
+  root, that invalidation can't accidentally evict another device's translations.
 
 ### End-to-end Flow Diagram
 
@@ -315,14 +330,15 @@ flowchart TD
   NcOn --> Inst
   NcOff --> Inst[Install IORT as an ACPI table]
   Inst --> Dis[Apply SmmuDisabledList<br/>mark each SMMU enabled/disabled]
-  Dis --> EnLoop["For each enabled SMMU:<br/>Program SMMU for Stage-2 Translation"]
+  Dis --> EnLoop["For each enabled SMMU:<br/>Program SMMU for Stage-2 (default)<br/>or Stage-1 Translation"]
   EnLoop --> DisLoop[For each disabled SMMU:<br/>disable translation, set global bypass]
   DisLoop --> Install[Install IOMMU protocol]
   Install --> Ready([SMMU ready;<br/>STEs sit in INVALID until promoted<br/>by the first mapping call])
 ```
 
 After init the SMMU hardware is configured but **no device is mapped yet**. Every STE is in `INVALID` until
-promoted, so any unsolicited DMA is dropped. STEs are promoted to `STAGE_2_TRANSLATE` lazily on the first
+promoted, so any unsolicited DMA is dropped. STEs are promoted (`STAGE_2_TRANSLATE` by default, or
+`STAGE_1_TRANSLATE / STAGE_2_BYPASS` when the platform opted into Stage 1) lazily on the first
 `IoMmuSetAttribute` / `IoMmuSetAttributeById` call for that StreamID.
 
 #### Runtime Map / SetAttribute / Unmap
@@ -347,14 +363,14 @@ flowchart TD
   SAX -->|caller-supplied SMMU base + StreamId| Sel
 
   Sel --> Pri{Primary StreamID<br/>context exists?}
-  Pri -- No --> Alloc[Allocate stage-2 root<br/>+ assign VMID]
-  Alloc --> Promote["Promote STE<br/>INVALID -&gt; STAGE_2_TRANSLATE<br/>break-before-make"]
+  Pri -- No --> Alloc[Allocate per-stream root<br/>+ assign VMID/ASID<br/>+ CD on Stage 1]
+  Alloc --> Promote["Promote STE<br/>INVALID -&gt; STAGE_2_TRANSLATE or STAGE_1_TRANSLATE<br/>break-before-make"]
   Promote --> Aliases
-  Pri -- Yes --> Aliases[For each alias StreamID:<br/>bind STE to primary's root + VMID<br/><i>SetAttributeById skips this step</i>]
+  Pri -- Yes --> Aliases[For each alias StreamID:<br/>bind STE to primary's root + tag<br/><i>Stage 2: shared S2Ttb + VMID<br/>Stage 1: shared CD via S1ContextPtr</i><br/><i>SetAttributeById skips this step</i>]
 
   Aliases --> PT{IoMmuAccess != 0?}
   PT -- Yes --> Upd[Update page table<br/>identity-map DeviceAddress<br/>set R/W flags]
-  PT -- No --> Inv[Invalidate page-table entry<br/>+ TLB invalidate per-VMID]
+  PT -- No --> Inv["Invalidate page-table entry<br/>+ TLB invalidate per-VMID (Stage 2)<br/>or per-ASID (Stage 1)"]
 
   Upd --> Done([Return])
   Inv --> Done
@@ -370,9 +386,9 @@ The diagram shows three caller paths that converge on the same per-StreamID isol
   straight into `IoMmuMap` and then forward the caller-supplied `(IommuBase, DmaId)` to `IoMmuSetAttributeById`
   instead of using a handle.
 - **SetAttribute is the worker for handle-aware callers.** It resolves the handle to StreamID(s) and SMMU base via
-  the IORT, lazily creates a per-stream stage-2 root + VMID and promotes the STE on first use, aliases additional
-  StreamIDs onto that root, then either installs (`IoMmuAccess != 0`) or tears down (`IoMmuAccess == 0`) the
-  identity mapping for the DMA address.
+  the IORT, lazily creates a per-stream page-table root and tag (VMID for Stage 2, ASID + CD for Stage 1) and
+  promotes the STE on first use, aliases additional StreamIDs onto that same state, then either installs
+  (`IoMmuAccess != 0`) or tears down (`IoMmuAccess == 0`) the identity mapping for the DMA address.
 - **SetAttributeById is the handle-less variant** used by `DmaLib` (and any other firmware-internal DMA agent that
   isn't described in the IORT). It skips both the handle-to-location lookup and the alias-binding loop - only the
   single `(IommuBase, DmaId)` the caller provided is promoted and programmed.
@@ -451,17 +467,22 @@ At translation time, when `PciIo->GetLocation()` returns Segment `0xFF`, SmmuDxe
 for a Named Component node with that name, and **uses every StreamID in that node's ID mappings** - not just one.
 
 This is where the alias logic from [Per-StreamID Isolation](#per-streamid-isolation) begins: the first StreamID
-returned becomes the **primary** and gets its own stage-2 page-table root and VMID. Every other StreamID emitted
-by the same IORT NC node is then **aliased** so its STE points at the *same* root and uses the *same* VMID. The
-device therefore sees one unified mapping no matter which of its StreamIDs the transaction was tagged with.
+returned becomes the **primary** and gets its own per-stream page-table root and tag (a VMID on Stage 2, or an
+ASID inside a Context Descriptor on Stage 1). Every other StreamID emitted by the same IORT NC node is then
+**aliased** so its STE points at the *same* root and uses the *same* tag - on Stage 2 the alias STE carries the
+same `S2Ttb + S2VMID` as the primary, on Stage 1 the alias STE's `S1ContextPtr` points at the primary's CD, so
+all aliases share the same ASID + Stage 1 root. The device therefore sees one unified mapping no matter which of
+its StreamIDs the transaction was tagged with.
 
 ```text
-NC HOB                    IORT Named Component                  SMMU stage-2
-+-----------+   match     +---------------------+   ID maps     +-----------------+
-| UniqueId  |  -------->  | ObjectName = "USB"  |  ----------> | Primary SID  -> Root R, VMID V
-| ObjName   |             |   - StreamID 0x10   |               | Alias  SID  -> Root R, VMID V (shared)
-+-----------+             |   - StreamID 0x11   |               | Alias  SID  -> Root R, VMID V (shared)
-                          +---------------------+               +-----------------+
+NC HOB                    IORT Named Component                  SMMU per-stream state
++-----------+   match     +---------------------+   ID maps     +-------------------------------------------+
+| UniqueId  |  -------->  | ObjectName = "USB"  |  ----------> | Primary SID -> Root R, tag T
+| ObjName   |             |   - StreamID 0x10   |               | Alias   SID -> Root R, tag T (shared)
++-----------+             |   - StreamID 0x11   |               | Alias   SID -> Root R, tag T (shared)
+                          +---------------------+               +-------------------------------------------+
+                                                                 tag = VMID (Stage 2, in STE)
+                                                                     = ASID (Stage 1, in shared CD via S1ContextPtr)
 ```
 
 Adding or removing alias StreamIDs is therefore purely an IORT edit - the platform NC table stays small and only
@@ -475,16 +496,29 @@ located via its offset and size in the header:
 
 ```c
 typedef struct _SMMU_CONFIG {
-  UINT32    VersionMajor;
-  UINT32    VersionMinor;
-  UINT32    SmmuDisabledListSize;   // Size of SmmuDisabledList in bytes.
-  UINT32    SmmuDisabledListOffset; // Offset to the SmmuDisabledList from the start of the HOB.
-  UINT32    IortSize;
-  UINT32    IortOffset;             // Offset to the IORT table from the start of the HOB.
-  UINT32    NcDeviceListSize;       // Size of the NonDiscoverable lookup array, in bytes.
-  UINT32    NcDeviceListOffset;     // Offset to the NonDiscoverable lookup array. 0 if absent.
+  UINT32                    VersionMajor;
+  UINT32                    VersionMinor;
+  UINT32                    SmmuDisabledListSize;   // Size of SmmuDisabledList in bytes.
+  UINT32                    SmmuDisabledListOffset; // Offset to the SmmuDisabledList from the start of the HOB.
+  UINT32                    IortSize;
+  UINT32                    IortOffset;             // Offset to the IORT table from the start of the HOB.
+  UINT32                    NcDeviceListSize;       // Size of the NonDiscoverable lookup array, in bytes.
+  UINT32                    NcDeviceListOffset;     // Offset to the NonDiscoverable lookup array. 0 if absent.
+  SMMU_TRANSLATION_STAGE    TranslationStage;       // SmmuTranslationStage2 (default) or SmmuTranslationStage1.
+                                                    // Applies to every SMMU described by this HOB.
 } SMMU_CONFIG;
 ```
+
+`SMMU_TRANSLATION_STAGE` is a shared enum defined in `<Guid/SmmuConfig.h>`:
+
+```c
+typedef enum _SMMU_TRANSLATION_STAGE {
+  SmmuTranslationStage2 = 0, // Stage 2 translate, Stage 1 bypass (default)
+  SmmuTranslationStage1 = 1, // Stage 1 translate, Stage 2 bypass
+} SMMU_TRANSLATION_STAGE;
+```
+
+Any value other than `SmmuTranslationStage1` is coerced to `SmmuTranslationStage2` by SmmuDxe.
 
 Visual layout (one possible ordering):
 
@@ -504,21 +538,45 @@ Visual layout (one possible ordering):
 
 ### 1. SMMUv3 Hardware Setup
 
-The SMMU is configured in stage 2 translation mode with:
+The SMMU is configured in **Stage 2 translation** mode by default, or in **Stage 1 translation** mode when the
+platform sets `SMMU_CONFIG->TranslationStage = SmmuTranslationStage1`. Every SMMU described by the HOB is
+configured for the same stage (see [Translation Stage](#translation-stage)). Both modes bring up:
 
 - Stream table for device ID mapping
 - Command queue for SMMU operations, like TLB management
 - Event queue for error handling
 - 4KB translation granule
 
+Stage 1 additionally allocates a per-stream Context Descriptor (CD) whose `S1ContextPtr` is installed in the STE
+so the SMMU can locate the CD (and through it, the Stage 1 root and ASID) when translating that stream.
+
+### Translation Stage
+
+- **Stage 2 (default, `SmmuTranslationStage2`)**: The SMMU installs `STAGE_2_TRANSLATE / STAGE_1_BYPASS` STEs.
+  Requires `IDR0.S2p`. Each StreamID's page-table root is encoded directly in the STE (`S2Ttb`, `S2VMID`).
+- **Stage 1 (`SmmuTranslationStage1`)**: The SMMU installs `STAGE_1_TRANSLATE / STAGE_2_BYPASS` STEs. Requires
+  `IDR0.S1p`. Each StreamID's page-table root and ASID live in a Context Descriptor (64-byte, page-aligned); the
+  STE's `S1ContextPtr` points at the CD. Stage 1 TLB entries are tagged with VMID = 0 (SMMUv3.2 §5.2) and
+  invalidation uses `CMD_TLBI_NH_ASID`. Concatenation at the starting level is not architecturally allowed for
+  Stage 1, so the walker uses a single-page root and dynamically picks L0 (OAS > 39 b) or L1 (OAS ≤ 39 b) as the
+  starting level.
+
+Choice of stage is a policy decision between platforms - the identity-mapping semantics that DMA agents observe
+are identical.
+
 ### 2. Page Table Structure
 
 The IOMMU uses up to a 4-level page table structure for DMA address translation:
 <https://developer.arm.com/documentation/101811/0104/Translation-granule/The-starting-level-of-address-translation>
 
-Depending on configuration from the SMMU registers, the starting level of translation is chosen.
-Depending on the SMMU configuration found, also supports Concatenated Translation Tables for the
-Translation Table Base.
+Depending on configuration from the SMMU registers, the starting level of translation is chosen. Stage 2 supports
+Concatenated Translation Tables at the starting level for wide OAS (Arm ARM D8.2.2); Stage 1 is architecturally
+forbidden from concatenating at the starting level (Arm ARM D8.5.2), so on Stage 1 the walker always installs a
+single-page root and picks the starting level dynamically:
+
+- **Stage 2 (default)**: 16-page concatenated root; L1 start for OAS < 44 b, L0 start for OAS ≥ 44 b.
+- **Stage 1**: single-page root; L1 start for OAS ≤ 39 b, L0 start otherwise. Full 48-bit input is covered by a
+  single L0 page (512 entries × 512 GB).
 
 ### 3. Address Translation Process
 
@@ -529,7 +587,9 @@ Translation Table Base.
 2. **SMMU Translation**:
    - Looks up Stream Table Entry (STE)
       - 2 level or Linear Stream Table. Depending on configurable maximum StreamId via IORT.
-   - Walks up to 4-level page tables
+   - Stage 2: walks up to 4-level Stage 2 page tables directly from `STE.S2Ttb`.
+   - Stage 1: dereferences `STE.S1ContextPtr` to fetch the Context Descriptor, then walks up to 4-level Stage 1
+     page tables from `CD.Ttb0`.
    - Converts IOVA to PA (Physical Address)
 
 ### Leaf Page Table Entry Updates and Break-Before-Make
@@ -541,6 +601,20 @@ Valid entry.
 
 That invariant is enforced on the map path: if the leaf is already valid, the new `Entry` must be byte-for-byte
 identical, otherwise `EFI_DEVICE_ERROR` is returned instead of overwriting in place.
+
+### TLB Invalidation
+
+The SMMU TLB caches translations tagged by the per-stream tag (VMID for Stage 2, ASID for Stage 1). The driver
+therefore issues a different invalidation command depending on the configured translation stage.
+
+| Stage   | Helper                        | Command                                              | Notes |
+|---------|-------------------------------|------------------------------------------------------|-------|
+| Stage 2 | `SmmuV3TLBInvalidateAllStage2` | `CMD_TLBI_S12_VMALL(Vmid)`                           | Invalidates **all** Stage 1 + Stage 2 TLB entries owned by the given `VMID`. VMID is read from the live STE (`S2Vmid`). VMID `0` is reserved and rejected. |
+| Stage 1 | `SmmuV3TLBInvalidateAllStage1` | `CMD_TLBI_NH_ASID(VMID = 0, Asid)`                   | Invalidates the non-secure hypervisor-EL2 TLB entries tagged with the given `ASID`. Per SMMUv3.2 §5.2, when only Stage 1 is enabled the STE's `S2VMID` is ignored and Stage 1 TLB entries are tagged with `VMID = 0`, so the invalidation always targets `VMID = 0`. ASID `0` is reserved and rejected. |
+
+Because per-stream tags (VMID/ASID) are unique per page-table root within the boot
+(see [Page table root and per-stream tag](#page-table-root-and-per-stream-tag)), an invalidation for one device
+cannot evict another device's translations even though the command targets an entire tag rather than a single IPA.
 
 ## Memory Protection
 
@@ -564,9 +638,9 @@ The IOMMU protocol provides several protection mechanisms:
 SmmuDxe hooks the SMMU's two error-reporting interrupts so translation faults and command/global errors are surfaced
 the moment they happen instead of being noticed only on the next mapping call:
 
-- **EVTQ IRQ** - fires when the SMMU pushes an entry into its **Event Queue** (e.g. a stage-2 translation fault for
-  some StreamID, a forbidden access, a CD/STE fetch fault, etc.). Each SMMU carries the per-SMMU `EvtqIrqNum`
-  parsed from the IORT SMMUv3 node.
+- **EVTQ IRQ** - fires when the SMMU pushes an entry into its **Event Queue** (e.g. a Stage 1 or Stage 2
+  translation fault for some StreamID, a forbidden access, a CD/STE fetch fault, etc.). Each SMMU carries the
+  per-SMMU `EvtqIrqNum` parsed from the IORT SMMUv3 node.
 - **GERR IRQ** - fires on **Global Errors** reported through `GERROR` / `GERRORN` (command-queue consumer faults,
   MSI write errors, queue overflow, etc.). Tracked as `GerrIrqNum`.
 
@@ -652,13 +726,11 @@ Current implementation constraints:
 1. Supports cache coherent SMMUs only
 2. Fixed 4KB granule size
 3. 48-bit address space limit
-4. Stage 2 translation only
-   - Stage 2 is used on its own (no Stage 1, no nested Stage 1+2) to keep the firmware translation model the same
-     regardless of whether the OS that takes over is a bare-metal kernel or a hypervisor.
-     By only ever programming Stage 2, firmware hands off a translation regime that for live
-     handoff scenarios both a hypervisor and a bare-metal OS can simply re-use the Stage 2 structures for its own
-     DMA-isolation page tables.
-   - Stage 2 offers simpler Stream Table strucutres without the need of Context Descriptors.
+4. Single translation stage per HOB
+   - The platform picks Stage 2 (default) or Stage 1 via `SMMU_CONFIG->TranslationStage`, and every SMMU described
+     by the HOB is configured for the same stage. Nested Stage 1 + Stage 2 is not supported.
+   - By only ever programming one stage, firmware hands off a translation regime that both a hypervisor and a
+     bare-metal OS can re-use for live handoff scenarios.
 5. Only Identity-mapped page tables are supported (one per StreamID, allocated lazily on first `IoMmuSetAttribute` for that StreamID)
 
 ## Future Enhancements
@@ -684,8 +756,9 @@ Key SMMU settings controlled through the SMMU config HOB:
 
 - **SmmuDisabledList:** Provides the platform the ability to individually disable/bypass an SMMU if needed.
   This list is a `UINT64[]` of SMMU base addresses that the platform wants to disable/bypass, located by
-  `SmmuDisabledListOffset` / `SmmuDisabledListSize`. By default every SMMU found in the IORT is configured for
-  Stage 2 Translation; any SMMU whose base appears in this list is instead set to global-bypass.
+  `SmmuDisabledListOffset` / `SmmuDisabledListSize`. By default every SMMU found in the IORT is configured for the
+  translation stage picked by `TranslationStage` (Stage 2 by default); any SMMU whose base appears in this list is
+  instead set to global-bypass.
 
 - **NonDiscoverable device lookup table (`NcDeviceListOffset` / `NcDeviceListSize`):** Maps each platform-assigned
   `UniqueId` (the value passed to `RegisterNonDiscoverableMmioDevice`) to the matching IORT Named Component
@@ -695,6 +768,13 @@ Key SMMU settings controlled through the SMMU config HOB:
   non-discoverable DMA-capable devices; otherwise NC StreamID resolution will fail. See
   [Mapping a Non-Discoverable Device to an IORT Named Component](#mapping-a-non-discoverable-device-to-an-iort-named-component)
   for the entry format and an example.
+
+- **TranslationStage:** Chooses the translation stage every SMMU in the HOB is configured for. Default
+  `SmmuTranslationStage2` matches previous behavior (Stage 2 translate, Stage 1 bypass);
+  `SmmuTranslationStage1` opts into Stage 1 translation (Stage 2 bypass). Any other value is coerced to
+  `SmmuTranslationStage2`. Requires the SMMU to advertise `IDR0.S1p` when Stage 1 is selected; otherwise
+  `SmmuV3Configure` will return `EFI_UNSUPPORTED` and driver init will fail. See
+  [Translation Stage](#translation-stage) for behavior differences.
 
 ## Platform Integration Instructions
 
@@ -710,7 +790,9 @@ Generic Platform Integration:
 
 3. **Publish the SMMU_CONFIG HOB** (`gSmmuConfigHobGuid`). Append (in any order) the IORT blob, the NC device lookup
    table (see [Non-Discoverable Device Integration](#non-discoverable-device-integration)), and the optional SMMU
-   disable list, then point the offsets/sizes in the `SMMU_CONFIG` header at them. Example:
+   disable list, then point the offsets/sizes in the `SMMU_CONFIG` header at them. Leave `TranslationStage` at
+   `SmmuTranslationStage2` (default) unless the platform explicitly wants Stage 1 - see
+   [Translation Stage](#translation-stage). Example:
 
    ```c
    STATIC CONST SMMU_NC_DEVICE_ENTRY  NcDeviceTable[] = {
@@ -724,6 +806,7 @@ Generic Platform Integration:
    SmmuConfig->IortOffset         = sizeof (SMMU_CONFIG);
    SmmuConfig->NcDeviceListSize   = sizeof (NcDeviceTable);
    SmmuConfig->NcDeviceListOffset = sizeof (SMMU_CONFIG) + sizeof (IortData);
+   SmmuConfig->TranslationStage   = SmmuTranslationStage2; // or SmmuTranslationStage1 to opt into Stage 1
 
    CopyMem ((UINT8 *)SmmuConfig + SmmuConfig->IortOffset,         &IortData,    sizeof (IortData));
    CopyMem ((UINT8 *)SmmuConfig + SmmuConfig->NcDeviceListOffset,  NcDeviceTable, sizeof (NcDeviceTable));
@@ -742,7 +825,7 @@ Generic Platform Integration:
 
 Integration with Qemu:
 
-- SMMU is supported on Qemu v9.1.50+  
+- SMMU is supported on Qemu v9.1.50+
 
 ## Relevant Docs
 

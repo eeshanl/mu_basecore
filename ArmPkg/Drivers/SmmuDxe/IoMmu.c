@@ -54,7 +54,7 @@ typedef struct IOMMU_MAP_INFO {
 **/
 STATIC
 EFI_STATUS
-SmmuV3DecodeSte (
+SmmuV3DecodeSteStage2 (
   IN  SMMUV3_STREAM_TABLE_ENTRY  *Ste,
   OUT PAGE_TABLE                 **Root,
   OUT UINT16                     *Vmid
@@ -110,6 +110,87 @@ SmmuV3AllocateVmid (
 }
 
 /**
+  Allocate the next per-stream ASID for SmmuInfo. Mirrors
+  SmmuV3AllocateVmid. ASID 0 is reserved as "unassigned"; the allocator
+  hands out 1..MaxAsid and never reuses within the same boot.
+
+  @param [in]   SmmuInfo  SMMU instance.
+  @param [out]  OutAsid   Receives the newly allocated ASID.
+
+  @retval EFI_SUCCESS            ASID allocated.
+  @retval EFI_OUT_OF_RESOURCES   ASID space exhausted.
+**/
+STATIC
+EFI_STATUS
+SmmuV3AllocateAsid (
+  IN  SMMU_INFO  *SmmuInfo,
+  OUT UINT16     *OutAsid
+  )
+{
+  UINT16  MaxAsid;
+
+  MaxAsid = SmmuInfo->Asid16Supported ? MAX_UINT16 : MAX_UINT8;
+  if (SmmuInfo->NextAsid == SMMU_ASID_RESERVED) {
+    DEBUG ((DEBUG_ERROR, "%a: ASID space exhausted on SMMU 0x%llx\n", __func__, SmmuInfo->SmmuBase));
+    ASSERT (SmmuInfo->NextAsid != SMMU_ASID_RESERVED);
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  *OutAsid = SmmuInfo->NextAsid;
+  if (SmmuInfo->NextAsid == MaxAsid) {
+    SmmuInfo->NextAsid = SMMU_ASID_RESERVED;
+  } else {
+    SmmuInfo->NextAsid++;
+  }
+
+  return EFI_SUCCESS;
+}
+
+/**
+  Decode the (CD, PageTableRoot, Asid) programmed in a Valid STAGE_1 STE.
+  Dereferences S1ContextPtr to reach the CD, which holds the Stage 1
+  root (CD.Ttb0) and ASID (CD.Asid). Caller must have already confirmed
+  Ste->Bits.Valid != 0.
+
+  @param [in]  Ste     STE slot.
+  @param [out] OutCd   Receives the CD pointer.
+  @param [out] Root    Receives the Stage 1 page-table root.
+  @param [out] Asid    Receives the ASID.
+
+  @retval EFI_SUCCESS            Decoded.
+  @retval EFI_INVALID_PARAMETER  Any parameter is NULL, or S1ContextPtr = 0.
+**/
+STATIC
+EFI_STATUS
+SmmuV3DecodeSteStage1 (
+  IN  SMMUV3_STREAM_TABLE_ENTRY  *Ste,
+  OUT SMMUV3_CONTEXT_DESCRIPTOR  **OutCd,
+  OUT PAGE_TABLE                 **Root,
+  OUT UINT16                     *Asid
+  )
+{
+  SMMUV3_CONTEXT_DESCRIPTOR  *Cd;
+
+  if ((Ste == NULL) || (OutCd == NULL) || (Root == NULL) || (Asid == NULL)) {
+    DEBUG ((DEBUG_ERROR, "%a: Invalid parameter\n", __func__));
+    ASSERT_EFI_ERROR (EFI_INVALID_PARAMETER);
+    return EFI_INVALID_PARAMETER;
+  }
+
+  Cd = (SMMUV3_CONTEXT_DESCRIPTOR *)(UINTN)((UINT64)Ste->Bits.S1ContextPtr << SMMUV3_STREAM_TABLE_ENTRY_S1CONTEXTPTR_OFFSET);
+  if (Cd == NULL) {
+    DEBUG ((DEBUG_ERROR, "%a: Valid Stage 1 STE with S1ContextPtr == 0\n", __func__));
+    ASSERT (Cd != NULL);
+    return EFI_INVALID_PARAMETER;
+  }
+
+  *OutCd = Cd;
+  *Root  = (PAGE_TABLE *)(UINTN)((UINT64)Cd->Bits.Ttb0 << SMMUV3_CD_TTB0_OFFSET);
+  *Asid  = (UINT16)Cd->Bits.Asid;
+  return EFI_SUCCESS;
+}
+
+/**
   Ensure a stage-2 page-table root exists for the given StreamID. On first
   call for a StreamID, allocates a fresh root + VMID and promotes the
   corresponding STE from Invalid to a Valid STAGE_2_TRANSLATE entry using
@@ -120,14 +201,10 @@ SmmuV3AllocateVmid (
   @param [in]   StreamId  StreamID.
   @param [out]  OutRoot   Receives the stage-2 page-table root.
   @param [out]  OutVmid   Receives the VMID tag installed in the STE.
-
-  @retval EFI_SUCCESS            Success.
-  @retval EFI_INVALID_PARAMETER  Invalid parameters.
-  @retval EFI_OUT_OF_RESOURCES   Allocation failed / VMID space exhausted.
-  @retval Other                  STE promotion failure.
 **/
+STATIC
 EFI_STATUS
-SmmuV3StreamGetOrCreate (
+SmmuV3StreamGetOrCreateStage2 (
   IN  SMMU_INFO   *SmmuInfo,
   IN  UINT32      StreamId,
   OUT PAGE_TABLE  **OutRoot,
@@ -142,12 +219,6 @@ SmmuV3StreamGetOrCreate (
   EFI_TPL                    OldTpl;
   BOOLEAN                    NewL2Consumed;
 
-  if ((SmmuInfo == NULL) || (OutRoot == NULL) || (OutVmid == NULL)) {
-    DEBUG ((DEBUG_ERROR, "%a: Invalid parameter\n", __func__));
-    ASSERT_EFI_ERROR (EFI_INVALID_PARAMETER);
-    return EFI_INVALID_PARAMETER;
-  }
-
   Ste = SmmuV3GetSteSlot (SmmuInfo, StreamId);
   if (Ste == NULL) {
     DEBUG ((DEBUG_ERROR, "%a: No STE slot for SmmuBase=0x%llx StreamId 0x%x\n", __func__, SmmuInfo->SmmuBase, StreamId));
@@ -157,7 +228,7 @@ SmmuV3StreamGetOrCreate (
 
   // Already promoted -> read the (Root, Vmid) the SMMU is actively using.
   if (Ste->Bits.Valid != 0) {
-    Status = SmmuV3DecodeSte (Ste, OutRoot, OutVmid);
+    Status = SmmuV3DecodeSteStage2 (Ste, OutRoot, OutVmid);
     if (EFI_ERROR (Status)) {
       DEBUG ((DEBUG_ERROR, "%a: Failed to decode STE for SmmuBase=0x%llx StreamId 0x%x\n", __func__, SmmuInfo->SmmuBase, StreamId));
       ASSERT_EFI_ERROR (Status);
@@ -166,7 +237,7 @@ SmmuV3StreamGetOrCreate (
     return Status;
   }
 
-  NewRoot = SmmuV3AllocatePageTableRoot ();
+  NewRoot = SmmuV3AllocatePageTableRoot (SmmuInfo);
   if (NewRoot == NULL) {
     DEBUG ((DEBUG_ERROR, "%a: Failed to allocate page-table root for SmmuBase=0x%llx StreamId 0x%x\n", __func__, SmmuInfo->SmmuBase, StreamId));
     ASSERT (NewRoot != NULL);
@@ -175,7 +246,7 @@ SmmuV3StreamGetOrCreate (
 
   NewL2 = (SMMUV3_STREAM_TABLE_ENTRY *)AllocatePages (1);
   if (NewL2 == NULL) {
-    FreeAlignedPages (NewRoot, EFI_PAGE_SIZE * PAGE_TABLE_ROOT_CONCATENATED_PAGES_MAX);
+    SmmuV3FreePageTableTree (SmmuInfo, 0, NewRoot);
     DEBUG ((DEBUG_ERROR, "%a: Failed to allocate L2 page for SmmuBase=0x%llx StreamId 0x%x\n", __func__, SmmuInfo->SmmuBase, StreamId));
     ASSERT (NewL2 != NULL);
     return EFI_OUT_OF_RESOURCES;
@@ -190,17 +261,17 @@ SmmuV3StreamGetOrCreate (
   Status = SmmuV3AllocateVmid (SmmuInfo, &NewVmid);
   if (EFI_ERROR (Status)) {
     gBS->RestoreTPL (OldTpl);
-    FreeAlignedPages (NewRoot, EFI_PAGE_SIZE * PAGE_TABLE_ROOT_CONCATENATED_PAGES_MAX);
+    SmmuV3FreePageTableTree (SmmuInfo, 0, NewRoot);
     FreePages (NewL2, 1);
     ASSERT_EFI_ERROR (Status);
     return Status;
   }
 
-  Status = SmmuV3PromoteSteToTranslate (SmmuInfo, StreamId, NewVmid, NewRoot, NewL2, &NewL2Consumed);
+  Status = SmmuV3PromoteSteToStage2Translate (SmmuInfo, StreamId, NewVmid, NewRoot, NewL2, &NewL2Consumed);
   if (EFI_ERROR (Status)) {
     DEBUG ((DEBUG_ERROR, "%a: Failed to promote STE for SmmuBase=0x%llx StreamId 0x%x: %r\n", __func__, SmmuInfo->SmmuBase, StreamId, Status));
     gBS->RestoreTPL (OldTpl);
-    SmmuV3FreePageTableTree (0, NewRoot);
+    SmmuV3FreePageTableTree (SmmuInfo, 0, NewRoot);
     if (!NewL2Consumed) {
       FreePages (NewL2, 1);
     }
@@ -212,7 +283,7 @@ SmmuV3StreamGetOrCreate (
   // Restore TPL after STE modifications are complete and the SMMU has been notified of the change.
   gBS->RestoreTPL (OldTpl);
 
-  // If SmmuV3PromoteSteToTranslate did not install NewL2 into an L1
+  // If SmmuV3PromoteSteToStage2Translate did not install NewL2 into an L1
   // descriptor (linear stream tables, or the covering L1 was already split),
   // the page is unused and must be freed here to avoid leaking it.
   if (!NewL2Consumed) {
@@ -225,43 +296,219 @@ SmmuV3StreamGetOrCreate (
 }
 
 /**
+  Stage 1 counterpart of SmmuV3StreamGetOrCreateStage2. On first call for
+  a StreamID, allocates a CD + ASID + Stage 1 page-table root, populates
+  the CD and promotes the STE from Invalid to STAGE_1_TRANSLATE /
+  STAGE_2_BYPASS. Subsequent calls read (Root, Asid) back out of the live
+  STE via CD dereference.
+
+  @param [in]   SmmuInfo  SMMU instance.
+  @param [in]   StreamId  StreamID.
+  @param [out]  OutRoot   Receives the Stage 1 page-table root.
+  @param [out]  OutAsid   Receives the ASID installed in the CD.
+**/
+STATIC
+EFI_STATUS
+SmmuV3StreamGetOrCreateStage1 (
+  IN  SMMU_INFO   *SmmuInfo,
+  IN  UINT32      StreamId,
+  OUT PAGE_TABLE  **OutRoot,
+  OUT UINT16      *OutAsid
+  )
+{
+  EFI_STATUS                 Status;
+  SMMUV3_STREAM_TABLE_ENTRY  *Ste;
+  SMMUV3_STREAM_TABLE_ENTRY  *NewL2;
+  SMMUV3_CONTEXT_DESCRIPTOR  *NewCd;
+  SMMUV3_CONTEXT_DESCRIPTOR  *ExistingCd;
+  PAGE_TABLE                 *NewRoot;
+  UINT16                     NewAsid;
+  EFI_TPL                    OldTpl;
+  BOOLEAN                    NewL2Consumed;
+
+  Ste = SmmuV3GetSteSlot (SmmuInfo, StreamId);
+  if (Ste == NULL) {
+    DEBUG ((DEBUG_ERROR, "%a: No STE slot for SmmuBase=0x%llx StreamId 0x%x\n", __func__, SmmuInfo->SmmuBase, StreamId));
+    ASSERT (Ste != NULL);
+    return EFI_INVALID_PARAMETER;
+  }
+
+  // Already promoted -> decode CD to recover (Root, Asid).
+  if (Ste->Bits.Valid != 0) {
+    Status = SmmuV3DecodeSteStage1 (Ste, &ExistingCd, OutRoot, OutAsid);
+    if (EFI_ERROR (Status)) {
+      DEBUG ((DEBUG_ERROR, "%a: Failed to decode Stage 1 STE for SmmuBase=0x%llx StreamId 0x%x\n", __func__, SmmuInfo->SmmuBase, StreamId));
+      ASSERT_EFI_ERROR (Status);
+    }
+
+    return Status;
+  }
+
+  NewRoot = SmmuV3AllocatePageTableRoot (SmmuInfo);
+  if (NewRoot == NULL) {
+    DEBUG ((DEBUG_ERROR, "%a: Failed to allocate Stage 1 page-table root for SmmuBase=0x%llx StreamId 0x%x\n", __func__, SmmuInfo->SmmuBase, StreamId));
+    ASSERT (NewRoot != NULL);
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  NewCd = SmmuV3AllocateContextDescriptor ();
+  if (NewCd == NULL) {
+    DEBUG ((DEBUG_ERROR, "%a: Failed to allocate CD for SmmuBase=0x%llx StreamId 0x%x\n", __func__, SmmuInfo->SmmuBase, StreamId));
+    SmmuV3FreePageTableTree (SmmuInfo, 0, NewRoot);
+    ASSERT (NewCd != NULL);
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  NewL2 = (SMMUV3_STREAM_TABLE_ENTRY *)AllocatePages (1);
+  if (NewL2 == NULL) {
+    SmmuV3FreeContextDescriptor (NewCd);
+    SmmuV3FreePageTableTree (SmmuInfo, 0, NewRoot);
+    DEBUG ((DEBUG_ERROR, "%a: Failed to allocate L2 page for SmmuBase=0x%llx StreamId 0x%x\n", __func__, SmmuInfo->SmmuBase, StreamId));
+    ASSERT (NewL2 != NULL);
+    return EFI_OUT_OF_RESOURCES;
+  }
+
+  ZeroMem (NewL2, EFI_PAGE_SIZE);
+  NewL2Consumed = FALSE;
+
+  // Raise TPL to prevent concurrent updates to the SMMU STEs.
+  OldTpl = gBS->RaiseTPL (TPL_HIGH_LEVEL);
+
+  Status = SmmuV3AllocateAsid (SmmuInfo, &NewAsid);
+  if (EFI_ERROR (Status)) {
+    gBS->RestoreTPL (OldTpl);
+    SmmuV3FreeContextDescriptor (NewCd);
+    SmmuV3FreePageTableTree (SmmuInfo, 0, NewRoot);
+    FreePages (NewL2, 1);
+    ASSERT_EFI_ERROR (Status);
+    return Status;
+  }
+
+  Status = SmmuV3BuildStage1ContextDescriptor (SmmuInfo, NewRoot, NewAsid, NewCd);
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "%a: Failed to build CD for SmmuBase=0x%llx StreamId 0x%x: %r\n", __func__, SmmuInfo->SmmuBase, StreamId, Status));
+    gBS->RestoreTPL (OldTpl);
+    SmmuV3FreeContextDescriptor (NewCd);
+    SmmuV3FreePageTableTree (SmmuInfo, 0, NewRoot);
+    FreePages (NewL2, 1);
+    ASSERT_EFI_ERROR (Status);
+    return Status;
+  }
+
+  // Publish CD writes before the SMMU can observe them via STE promotion.
+  ArmDataSynchronizationBarrier ();
+
+  Status = SmmuV3PromoteSteToStage1Translate (SmmuInfo, StreamId, NewCd, NewL2, &NewL2Consumed);
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "%a: Failed to promote Stage 1 STE for SmmuBase=0x%llx StreamId 0x%x: %r\n", __func__, SmmuInfo->SmmuBase, StreamId, Status));
+    gBS->RestoreTPL (OldTpl);
+    SmmuV3FreeContextDescriptor (NewCd);
+    SmmuV3FreePageTableTree (SmmuInfo, 0, NewRoot);
+    if (!NewL2Consumed) {
+      FreePages (NewL2, 1);
+    }
+
+    ASSERT_EFI_ERROR (Status);
+    return Status;
+  }
+
+  gBS->RestoreTPL (OldTpl);
+
+  if (!NewL2Consumed) {
+    FreePages (NewL2, 1);
+  }
+
+  *OutRoot = NewRoot;
+  *OutAsid = NewAsid;
+  return EFI_SUCCESS;
+}
+
+/**
+  Ensure a per-stream page-table root exists for the given StreamID and
+  dispatch to the stage-appropriate allocator.
+
+  For Stage 2 SMMUs the returned tag is the VMID that identifies the
+  page-table root in the STE. For Stage 1 SMMUs the returned tag is the
+  ASID stored in the per-stream CD. In both cases the tag can be fed to
+  the stage-appropriate TLB invalidation helper.
+
+  @param [in]   SmmuInfo   SMMU instance.
+  @param [in]   StreamId   StreamID.
+  @param [out]  OutRoot    Receives the per-stream page-table root.
+  @param [out]  OutTagId   Receives the per-stream ID tag (VMID for Stage 2,
+                           ASID for Stage 1).
+
+  @retval EFI_SUCCESS            Success.
+  @retval EFI_INVALID_PARAMETER  Invalid parameters.
+  @retval EFI_OUT_OF_RESOURCES   Allocation failed / VMID/ASID space exhausted.
+  @retval Other                  STE promotion failure.
+**/
+EFI_STATUS
+SmmuV3StreamGetOrCreate (
+  IN  SMMU_INFO   *SmmuInfo,
+  IN  UINT32      StreamId,
+  OUT PAGE_TABLE  **OutRoot,
+  OUT UINT16      *OutTagId
+  )
+{
+  if ((SmmuInfo == NULL) || (OutRoot == NULL) || (OutTagId == NULL)) {
+    DEBUG ((DEBUG_ERROR, "%a: Invalid parameter\n", __func__));
+    ASSERT_EFI_ERROR (EFI_INVALID_PARAMETER);
+    return EFI_INVALID_PARAMETER;
+  }
+
+  if (SmmuInfo->TranslationStage == SmmuTranslationStage1) {
+    return SmmuV3StreamGetOrCreateStage1 (SmmuInfo, StreamId, OutRoot, OutTagId);
+  }
+
+  return SmmuV3StreamGetOrCreateStage2 (SmmuInfo, StreamId, OutRoot, OutTagId);
+}
+
+/**
   Bind a StreamID's STE to share an existing primary stream's stage-2
   page-table root and VMID. Used when a single device exposes multiple
   StreamIDs that must all see the same translations.
 
-  If the alias STE already encodes the same (Root, Vmid) it is a no-op.
-  Otherwise the alias STE is promoted in place to publish the shared root +
-  VMID. An alias STE that has already been promoted with a *different*
-  root is treated as a configuration error.
+  For Stage 2 the shared state is (root, VMID) encoded in the STE. For
+  Stage 1 both STEs point at the same CD via S1ContextPtr. A no-op if the
+  alias STE already encodes the same state; a configuration error if it
+  is already promoted with a different primary.
 
-  @param [in]  SmmuInfo       SMMU instance.
-  @param [in]  AliasStreamId  StreamID that should alias the primary.
-  @param [in]  PrimaryRoot    Primary stream's page-table root (non-NULL).
-  @param [in]  PrimaryVmid    Primary stream's VMID (non-zero).
+  @param [in]  SmmuInfo         SMMU instance.
+  @param [in]  PrimaryStreamId  Primary StreamID (used to recover the
+                                Stage 1 CD via S1ContextPtr).
+  @param [in]  AliasStreamId    StreamID that should alias the primary.
+  @param [in]  PrimaryRoot      Primary's page-table root (non-NULL).
+  @param [in]  PrimaryTagId     Primary's tag: VMID for Stage 2, ASID for
+                                Stage 1 (non-zero).
 
   @retval EFI_SUCCESS            Alias bound.
   @retval EFI_INVALID_PARAMETER  Invalid parameters.
-  @retval EFI_ALREADY_STARTED    Alias STE already points at a different root.
+  @retval EFI_ALREADY_STARTED    Alias STE already points elsewhere.
   @retval Other                  STE-promotion failure.
 **/
 STATIC
 EFI_STATUS
 SmmuV3StreamAlias (
   IN  SMMU_INFO   *SmmuInfo,
+  IN  UINT32      PrimaryStreamId,
   IN  UINT32      AliasStreamId,
   IN  PAGE_TABLE  *PrimaryRoot,
-  IN  UINT16      PrimaryVmid
+  IN  UINT16      PrimaryTagId
   )
 {
   EFI_STATUS                 Status;
   SMMUV3_STREAM_TABLE_ENTRY  *AliasSte;
+  SMMUV3_STREAM_TABLE_ENTRY  *PrimarySte;
   SMMUV3_STREAM_TABLE_ENTRY  *NewL2;
+  SMMUV3_CONTEXT_DESCRIPTOR  *PrimaryCd;
+  SMMUV3_CONTEXT_DESCRIPTOR  *ExistingCd;
   PAGE_TABLE                 *ExistingRoot;
-  UINT16                     ExistingVmid;
+  UINT16                     ExistingTagId;
   EFI_TPL                    OldTpl;
   BOOLEAN                    NewL2Consumed;
 
-  if ((SmmuInfo == NULL) || (PrimaryRoot == NULL) || (PrimaryVmid == 0)) {
+  if ((SmmuInfo == NULL) || (PrimaryRoot == NULL) || (PrimaryTagId == 0)) {
     DEBUG ((DEBUG_ERROR, "%a: Invalid parameter\n", __func__));
     ASSERT_EFI_ERROR (EFI_INVALID_PARAMETER);
     return EFI_INVALID_PARAMETER;
@@ -274,15 +521,110 @@ SmmuV3StreamAlias (
     return EFI_INVALID_PARAMETER;
   }
 
-  // If the alias STE is already promoted, compare against the primary.
-  if (AliasSte->Bits.Valid != 0) {
-    Status = SmmuV3DecodeSte (AliasSte, &ExistingRoot, &ExistingVmid);
+  if (SmmuInfo->TranslationStage == SmmuTranslationStage1) {
+    // Stage 1: alias by pointing the alias STE at the primary's CD.
+    PrimarySte = SmmuV3GetSteSlot (SmmuInfo, PrimaryStreamId);
+    if ((PrimarySte == NULL) || (PrimarySte->Bits.Valid == 0)) {
+      DEBUG ((
+        DEBUG_ERROR,
+        "%a: Primary StreamId 0x%x on SmmuBase=0x%llx has no valid STE; cannot alias 0x%x to it\n",
+        __func__,
+        PrimaryStreamId,
+        SmmuInfo->SmmuBase,
+        AliasStreamId
+        ));
+      ASSERT ((PrimarySte != NULL) && (PrimarySte->Bits.Valid != 0));
+      return EFI_INVALID_PARAMETER;
+    }
+
+    Status = SmmuV3DecodeSteStage1 (PrimarySte, &PrimaryCd, &ExistingRoot, &ExistingTagId);
     if (EFI_ERROR (Status)) {
       ASSERT_EFI_ERROR (Status);
       return Status;
     }
 
-    if ((ExistingRoot == PrimaryRoot) && (ExistingVmid == PrimaryVmid)) {
+    // If the alias STE is already promoted, compare CDs.
+    if (AliasSte->Bits.Valid != 0) {
+      Status = SmmuV3DecodeSteStage1 (AliasSte, &ExistingCd, &ExistingRoot, &ExistingTagId);
+      if (EFI_ERROR (Status)) {
+        ASSERT_EFI_ERROR (Status);
+        return Status;
+      }
+
+      if (ExistingCd == PrimaryCd) {
+        return EFI_SUCCESS;
+      }
+
+      DEBUG ((
+        DEBUG_ERROR,
+        "%a: Stage 1 alias StreamId 0x%x already has its own CD %p; cannot alias to %p\n",
+        __func__,
+        AliasStreamId,
+        ExistingCd,
+        PrimaryCd
+        ));
+      ASSERT (ExistingCd == PrimaryCd);
+      return EFI_ALREADY_STARTED;
+    }
+
+    NewL2 = (SMMUV3_STREAM_TABLE_ENTRY *)AllocatePages (1);
+    if (NewL2 == NULL) {
+      DEBUG ((DEBUG_ERROR, "%a: Failed to allocate L2 page for SmmuBase=0x%llx alias StreamId 0x%x\n", __func__, SmmuInfo->SmmuBase, AliasStreamId));
+      ASSERT (NewL2 != NULL);
+      return EFI_OUT_OF_RESOURCES;
+    }
+
+    ZeroMem (NewL2, EFI_PAGE_SIZE);
+    NewL2Consumed = FALSE;
+
+    OldTpl = gBS->RaiseTPL (TPL_HIGH_LEVEL);
+
+    Status = SmmuV3PromoteSteToStage1Translate (SmmuInfo, AliasStreamId, PrimaryCd, NewL2, &NewL2Consumed);
+    if (EFI_ERROR (Status)) {
+      DEBUG ((
+        DEBUG_ERROR,
+        "%a: Stage 1 STE promotion failed for alias StreamId 0x%x: %r\n",
+        __func__,
+        AliasStreamId,
+        Status
+        ));
+      ASSERT_EFI_ERROR (Status);
+      gBS->RestoreTPL (OldTpl);
+      if (!NewL2Consumed) {
+        FreePages (NewL2, 1);
+      }
+
+      return Status;
+    }
+
+    gBS->RestoreTPL (OldTpl);
+
+    if (!NewL2Consumed) {
+      FreePages (NewL2, 1);
+    }
+
+    DEBUG ((
+      DEBUG_VERBOSE,
+      "%a: Aliased Stage 1 StreamId 0x%x (CD=%p ASID=0x%x)\n",
+      __func__,
+      AliasStreamId,
+      PrimaryCd,
+      PrimaryTagId
+      ));
+
+    return EFI_SUCCESS;
+  }
+
+  // Stage 2 (default): alias by sharing S2Ttb + VMID.
+  // If the alias STE is already promoted, compare against the primary.
+  if (AliasSte->Bits.Valid != 0) {
+    Status = SmmuV3DecodeSteStage2 (AliasSte, &ExistingRoot, &ExistingTagId);
+    if (EFI_ERROR (Status)) {
+      ASSERT_EFI_ERROR (Status);
+      return Status;
+    }
+
+    if ((ExistingRoot == PrimaryRoot) && (ExistingTagId == PrimaryTagId)) {
       return EFI_SUCCESS;
     }
 
@@ -313,10 +655,10 @@ SmmuV3StreamAlias (
   // Raise TPL to prevent concurrent updates to the SMMU STEs.
   OldTpl = gBS->RaiseTPL (TPL_HIGH_LEVEL);
 
-  Status = SmmuV3PromoteSteToTranslate (
+  Status = SmmuV3PromoteSteToStage2Translate (
              SmmuInfo,
              AliasStreamId,
-             PrimaryVmid,
+             PrimaryTagId,
              PrimaryRoot,
              NewL2,
              &NewL2Consumed
@@ -342,7 +684,7 @@ SmmuV3StreamAlias (
   // Restore TPL before promoting the alias STE.
   gBS->RestoreTPL (OldTpl);
 
-  // If SmmuV3PromoteSteToTranslate did not install NewL2 into an L1
+  // If SmmuV3PromoteSteToStage2Translate did not install NewL2 into an L1
   // descriptor (linear stream tables, or the covering L1 was already split),
   // the page is unused and must be freed here to avoid leaking it.
   if (!NewL2Consumed) {
@@ -355,7 +697,7 @@ SmmuV3StreamAlias (
     __func__,
     AliasStreamId,
     PrimaryRoot,
-    PrimaryVmid
+    PrimaryTagId
     ));
 
   return EFI_SUCCESS;
@@ -402,6 +744,7 @@ UpdateMapping (
   PAGE_TABLE  *NewPage;
   UINT64      Entry;
   EFI_TPL     OldTpl;
+  UINT16      Stage1Ap;
   PAGE_TABLE  *NewPageList[PAGE_TABLE_DEPTH];
 
   // Attributes must be a valid Stage 2 Translation Table attribute (12 bits or less)
@@ -487,8 +830,24 @@ UpdateMapping (
 
     if (Valid) {
       Entry = (PhysicalAddress & ~PAGE_TABLE_BLOCK_MASK);
-      // validate entry and set leaf level attributes
-      Entry |= Attributes | PAGE_TABLE_S2_MEMATTR_NORMAL_WB | TT_SH_INNER_SHAREABLE | TT_AF | PAGE_TABLE_DESCRIPTOR | PAGE_TABLE_ENTRY_VALID_BIT;
+      //
+      // Stage 1 uses AttrIndx (bits [4:2], indexes MAIR in the CD) and
+      // AP[2:1] (bit [7:6]); Stage 2 uses MemAttr (bits [5:2]) and S2AP
+      // (bits [7:6]). The Attributes parameter carries the Stage 2 R/W
+      // encoding; for Stage 1 translate the write bit into AP[2:1].
+      //
+      if (SmmuInfo->TranslationStage == SmmuTranslationStage1) {
+        Stage1Ap = ((Attributes & PAGE_TABLE_WRITE_BIT) != 0) ? TT_AP_RW_RW : TT_AP_RO_RO;
+        Entry   |= PAGE_TABLE_S1_ATTRINDX0 |
+                   Stage1Ap |
+                   TT_SH_INNER_SHAREABLE |
+                   TT_AF |
+                   PAGE_TABLE_DESCRIPTOR |
+                   PAGE_TABLE_ENTRY_VALID_BIT;
+      } else {
+        // validate entry and set leaf level attributes (Stage 2)
+        Entry |= Attributes | PAGE_TABLE_S2_MEMATTR_NORMAL_WB | TT_SH_INNER_SHAREABLE | TT_AF | PAGE_TABLE_DESCRIPTOR | PAGE_TABLE_ENTRY_VALID_BIT;
+      }
 
       // Break-before-make does not apply here because we are only switching between invalid/valid, no other Entry bits are changing.
       // If the entry is already valid, it must have the same PA and attributes to be considered a match; otherwise it's an error because we don't expect multiple mappings for the same VA.
@@ -530,7 +889,10 @@ End:
 
   @param [in]  SmmuInfo                   SMMU instance.
   @param [in]  Root                       Pointer to the root page table.
-  @param [in]  Vmid                       VMID for associated page table root.
+  @param [in]  TagId                      Per-stream tag whose TLB entries
+                                          should be invalidated on unmap.
+                                          VMID for Stage 2 SMMUs, ASID for
+                                          Stage 1 SMMUs.
   @param [in]  PhysicalAddress            Physical address to map.
   @param [in]  Bytes                      Number of bytes to map.
   @param [in]  Attributes                 Attributes to set for the mapping. Must be a valid Stage 2 Translation Table attribute (12 bits or less).
@@ -544,7 +906,7 @@ EFI_STATUS
 UpdatePageTable (
   IN SMMU_INFO   *SmmuInfo,
   IN PAGE_TABLE  *Root,
-  IN UINT16      Vmid,
+  IN UINT16      TagId,
   IN UINT64      PhysicalAddress,
   IN UINT64      Bytes,
   IN UINT16      Attributes,
@@ -577,10 +939,18 @@ UpdatePageTable (
   // Only invalidate the TLB if we are unmapping the page table entries because
   // we are only swapping between valid and invalid entries, and no other bits are changing in the entry.
   if (!Valid) {
-    Status = SmmuV3TLBInvalidateAll (SmmuInfo, Vmid);
-    if (EFI_ERROR (Status)) {
-      DEBUG ((DEBUG_ERROR, "%a: Failed to invalidate TLB for Vmid 0x%llx\n", __func__, Vmid));
-      goto End;
+    if (SmmuInfo->TranslationStage == SmmuTranslationStage1) {
+      Status = SmmuV3TLBInvalidateAllStage1 (SmmuInfo, TagId);
+      if (EFI_ERROR (Status)) {
+        DEBUG ((DEBUG_ERROR, "%a: Failed to invalidate Stage 1 TLB for ASID 0x%x\n", __func__, TagId));
+        goto End;
+      }
+    } else {
+      Status = SmmuV3TLBInvalidateAllStage2 (SmmuInfo, TagId);
+      if (EFI_ERROR (Status)) {
+        DEBUG ((DEBUG_ERROR, "%a: Failed to invalidate TLB for Vmid 0x%llx\n", __func__, TagId));
+        goto End;
+      }
     }
   }
 
@@ -993,7 +1363,13 @@ IoMmuSetAttributeHelper (
       SMMU_STREAM_ID_ENTRY  *AliasEntry;
 
       AliasEntry = BASE_CR (Link, SMMU_STREAM_ID_ENTRY, Link);
-      Status     = SmmuV3StreamAlias (TargetSmmu, AliasEntry->StreamId, PrimaryRoot, PrimaryVmid);
+      Status     = SmmuV3StreamAlias (
+                     TargetSmmu,
+                     PrimaryStreamId,
+                     AliasEntry->StreamId,
+                     PrimaryRoot,
+                     PrimaryVmid
+                     );
       if (EFI_ERROR (Status)) {
         DEBUG ((
           DEBUG_ERROR,

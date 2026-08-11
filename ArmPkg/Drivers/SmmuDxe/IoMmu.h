@@ -15,15 +15,22 @@
   <https://developer.arm.com/documentation/ddi0487/mc/>
 
   Note: shared architectural bit definitions (access flag, inner shareable,
-  etc.) are pulled from <AArch64/AArch64Mmu.h> (via <Library/ArmLib.h>) as
-  TT_AF, TT_SH_INNER_SHAREABLE. Only Stage-2 specific and
-  IOMMU-specific helpers are defined here.
+  AP[2:1], etc.) are pulled from <AArch64/AArch64Mmu.h> (via
+  <Library/ArmLib.h>) as TT_AF, TT_SH_INNER_SHAREABLE, TT_AP_RW_RW,
+  TT_AP_RO_RO. Only Stage-2 specific and IOMMU-specific helpers are
+  defined here.
 **/
 #define PAGE_TABLE_ENTRY_VALID_BIT  0x1
 #define PAGE_TABLE_BLOCK_MASK       0xFFF
 #define PAGE_TABLE_DESCRIPTOR       (0x1 << 1)
 #define PAGE_TABLE_READ_WRITE_FROM_IOMMU_ACCESS(IoMmuAccess)  (IoMmuAccess << 6)
+#define PAGE_TABLE_WRITE_BIT             (0x1 << 7)
 #define PAGE_TABLE_S2_MEMATTR_NORMAL_WB  (0xF << 2)
+
+// Stage 1 VMSAv8-64 leaf descriptor AttrIndex bits (used when the SMMU
+// is configured for Stage 1 translation). AttrIndex 0 selects MAIR[0]
+// in the CD (Normal Inner+Outer WBWA per SmmuV3BuildStage1ContextDescriptor).
+#define PAGE_TABLE_S1_ATTRINDX0  (0x0 << 2)
 
 typedef UINT64 PAGE_TABLE_ENTRY;
 

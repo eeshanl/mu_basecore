@@ -116,6 +116,17 @@ SmmuV3EncodeAddressWidth (
   Set the translation starting level for SMMUv3 page tables.
   Only 3 and 4 level paging are supported.
 
+  Stage 2: dynamically picks between L0 (>= 44 bits OAS) and concatenated
+  L1 (< 44 bits OAS) to minimize walk depth. `*S2Sl0` receives the S2SL0
+  encoding for the chosen starting level.
+
+  Stage 1: concatenation at the starting level is not architecturally
+  allowed (Arm ARM D8.5.2). A non-concatenated single-page root covers at
+  most `PAGE_TABLE_CONCATENATED_PAGES_BITS_CUTOFF` bits from L1, so the
+  helper picks L0 for wider inputs and L1 otherwise, and forces
+  `PageTableRootConcatenated = FALSE`. `*S2Sl0` is zeroed because the CD
+  has no SL0 field (starting level is inferred from CD.T0Sz).
+
   @param [in]  SmmuInfo           Pointer to the SMMU_INFO structure.
   @param [in]  OutputAddressWidth  The output address width.
   @param [out] S2Sl0              The starting level for stage 2 translation.
@@ -135,6 +146,24 @@ SmmuV3SetTranslationStartingLevel (
     return EFI_INVALID_PARAMETER;
   }
 
+  if (SmmuInfo->TranslationStage == SmmuTranslationStage1) {
+    //
+    // Stage 1: no concatenation. Single-page L1 root covers up to
+    // PAGE_TABLE_CONCATENATED_PAGES_BITS_CUTOFF bits; L0 covers the
+    // full 48-bit input at 4KB granule.
+    //
+    if (OutputAddressWidth > PAGE_TABLE_CONCATENATED_PAGES_BITS_CUTOFF) {
+      SmmuInfo->TranslationStartingLevel = 0;    // 4-level paging (L0..L3)
+    } else {
+      SmmuInfo->TranslationStartingLevel = 1;    // 3-level paging (L1..L3)
+    }
+
+    SmmuInfo->PageTableRootConcatenated = FALSE;
+    *S2Sl0                              = 0;     // unused for Stage 1 (no SL0 in CD)
+    return EFI_SUCCESS;
+  }
+
+  // Stage 2:
   // Per the Arm ARM VMSA spec, >= 44 bits of address width requires 4 level paging.
   // Otherwise, 3 level paging is used.
   if (OutputAddressWidth >= PAGE_TABLE_4_LEVEL_OUTPUT_ADDRESS_WIDTH_MIN) {
@@ -450,7 +479,6 @@ SmmuV3SetGlobalBypass (
   // SMMU_(S)_CR0 resets to zero with all streams bypassing the SMMU
   RegVal = SmmuV3ReadRegister32 (SmmuBase, SMMU_GBPA);
 
-  // TF-A configures the SMMUv3 to abort all incoming transactions.
   // Clear the SMMU_GBPA.ABORT to allow Non-secure streams to bypass
   // the SMMU.
   RegVal &= ~SMMU_GBPA_ABORT;
@@ -1178,8 +1206,8 @@ SmmuV3SendCommand (
 }
 
 /**
-  Invalidate all TLB entries in the SMMUv3.
-  Uses CMD_TLBI_S12_VMALL to invalidate all Stage 2 TLB entries for the specified VMID.
+  Invalidate all Stage 2 TLB entries owned by the given VMID on this SMMU.
+  Uses CMD_TLBI_S12_VMALL.
 
   @param [in]  SmmuInfo  Pointer to the SMMU_INFO structure.
   @param [in]  Vmid      The VMID to invalidate.
@@ -1189,7 +1217,7 @@ SmmuV3SendCommand (
   @retval EFI_INVALID_PARAMETER  Invalid Parameters.
 **/
 EFI_STATUS
-SmmuV3TLBInvalidateAll (
+SmmuV3TLBInvalidateAllStage2 (
   IN SMMU_INFO  *SmmuInfo,
   IN UINT16     Vmid
   )
@@ -1215,6 +1243,54 @@ SmmuV3TLBInvalidateAll (
 
   // Issue a CMD_SYNC command to guarantee that any previously issued TLB
   // invalidations (CMD_TLBI_*) are completed (SMMUv3.2 spec section 4.6.3).
+  SMMUV3_BUILD_CMD_SYNC_NO_INTERRUPT (&Command);
+  Status = SmmuV3SendCommand (SmmuInfo, &Command);
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "%a: CMD_SYNC_NO_INTERRUPT failed.\n", __func__));
+    return Status;
+  }
+
+  ArmDataSynchronizationBarrier ();
+
+  return Status;
+}
+
+/**
+  Invalidate all Stage 1 TLB entries owned by the given ASID on this SMMU.
+  Per SMMUv3.2 §5.2, Stage 1 TLB entries are tagged with VMID = 0 when
+  only Stage 1 is enabled, so the invalidation targets VMID = 0.
+
+  @param [in]  SmmuInfo  Pointer to the SMMU_INFO structure.
+  @param [in]  Asid      ASID to invalidate.
+
+  @retval EFI_SUCCESS            Success.
+  @retval EFI_TIMEOUT            Timeout.
+  @retval EFI_INVALID_PARAMETER  Invalid Parameters.
+**/
+EFI_STATUS
+SmmuV3TLBInvalidateAllStage1 (
+  IN SMMU_INFO  *SmmuInfo,
+  IN UINT16     Asid
+  )
+{
+  SMMUV3_CMD_GENERIC  Command;
+  EFI_STATUS          Status;
+
+  if ((SmmuInfo == NULL) || (Asid == SMMU_ASID_RESERVED)) {
+    DEBUG ((DEBUG_ERROR, "%a: Invalid Parameters\n", __func__));
+    return EFI_INVALID_PARAMETER;
+  }
+
+  ArmDataSynchronizationBarrier ();
+
+  // Target the (VMID = 0, ASID) TLB entries.
+  SMMUV3_BUILD_CMD_TLBI_NH_ASID (&Command, SMMUV3_STREAM_TABLE_ENTRY_S1_ONLY_VMID, Asid);
+  Status = SmmuV3SendCommand (SmmuInfo, &Command);
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "%a: CMD_TLBI_NH_ASID failed for Asid 0x%x.\n", __func__, Asid));
+    return Status;
+  }
+
   SMMUV3_BUILD_CMD_SYNC_NO_INTERRUPT (&Command);
   Status = SmmuV3SendCommand (SmmuInfo, &Command);
   if (EFI_ERROR (Status)) {

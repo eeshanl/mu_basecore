@@ -81,23 +81,39 @@ AddIortTable (
   Initialize a page table. Only initializes the root page table.
   UpdateMapping() will allocate entries on the fly as needed.
 
-  To support concatenated page tables, allocate the max amount of pages we are allowed to concatenate, 16.
+  Root size depends on SmmuInfo->TranslationStage: Stage 2 allocates the
+  full concatenated span so any OAS up to 48 bits can be indexed from L1.
+  Stage 1 allocates a single-page root; concatenation at the starting
+  level is not architecturally allowed for Stage 1, so the walker starts
+  at L1 for OAS <= 39 bits and at L0 for wider OAS (see
+  SmmuV3SetTranslationStartingLevel).
+
+  @param [in]  SmmuInfo  SMMU instance whose TranslationStage picks the
+                         allocation size.
 
   @retval A pointer to the initialized page table, or NULL on failure.
 **/
 PAGE_TABLE *
 SmmuV3AllocatePageTableRoot (
-  VOID
+  IN SMMU_INFO  *SmmuInfo
   )
 {
   PAGE_TABLE  *PageTable;
+  UINTN       NumPages;
 
-  // To support concatenated page tables, allocate the max amount of pages we are allowed to concatenate, 16.
-  // Arm DDI0487L_a_a-profile_architecture_reference_manual section D8.2.2 states:
-  // Align the base address of the first translation table to the sum of the size of the memory occupied by the concatenated translation tables.
+  if (SmmuInfo == NULL) {
+    DEBUG ((DEBUG_ERROR, "%a: Invalid Parameters\n", __func__));
+    return NULL;
+  }
+
+  NumPages = PAGE_TABLE_ROOT_PAGES (SmmuInfo);
+
+  // Align the base address of the first translation table to the sum of the
+  // size of the memory occupied by the concatenated translation tables. For
+  // Stage 1 (no concatenation) this simplifies to a single 4 KB alignment.
   PageTable = (PAGE_TABLE *)AllocateAlignedPages (
-                              PAGE_TABLE_ROOT_CONCATENATED_PAGES_MAX,
-                              EFI_PAGES_TO_SIZE (PAGE_TABLE_ROOT_CONCATENATED_PAGES_MAX)
+                              NumPages,
+                              EFI_PAGES_TO_SIZE (NumPages)
                               );
 
   if (PageTable == NULL) {
@@ -105,7 +121,7 @@ SmmuV3AllocatePageTableRoot (
     return NULL;
   }
 
-  ZeroMem (PageTable, EFI_PAGES_TO_SIZE (PAGE_TABLE_ROOT_CONCATENATED_PAGES_MAX));
+  ZeroMem (PageTable, EFI_PAGES_TO_SIZE (NumPages));
 
   return PageTable;
 }
@@ -114,11 +130,13 @@ SmmuV3AllocatePageTableRoot (
   Recursivley deinitialize and free a page table for all previously
   allocated entries, given its level and pointer.
 
+  @param [in]  SmmuInfo   SMMU instance the tree belongs to.
   @param [in]  Level      The level of the page table to deinitialize.
   @param [in]  PageTable  The page table to deinitialize.
 **/
 VOID
 SmmuV3FreePageTableTree (
+  IN SMMU_INFO   *SmmuInfo,
   IN UINT8       Level,
   IN PAGE_TABLE  *PageTable
   )
@@ -127,7 +145,7 @@ SmmuV3FreePageTableTree (
   PAGE_TABLE_ENTRY  Entry;
   PAGE_TABLE        *PageTableAddress;
 
-  if ((Level >= PAGE_TABLE_DEPTH) || (PageTable == NULL)) {
+  if ((SmmuInfo == NULL) || (Level >= PAGE_TABLE_DEPTH) || (PageTable == NULL)) {
     return;
   }
 
@@ -136,13 +154,14 @@ SmmuV3FreePageTableTree (
     PageTableAddress = (PAGE_TABLE *)((UINTN)Entry & ~PAGE_TABLE_BLOCK_MASK);
 
     if (Entry != 0) {
-      SmmuV3FreePageTableTree (Level + 1, PageTableAddress);
+      SmmuV3FreePageTableTree (SmmuInfo, Level + 1, PageTableAddress);
     }
   }
 
-  // For root level, use larger size to free for supporting a concatenated page table root.
+  // Root level allocation size depends on TranslationStage; deeper levels
+  // are always single pages allocated by UpdateMapping().
   if (Level == 0) {
-    FreePages (PageTable, PAGE_TABLE_ROOT_CONCATENATED_PAGES_MAX);
+    FreePages (PageTable, PAGE_TABLE_ROOT_PAGES (SmmuInfo));
   } else {
     FreePages (PageTable, 1);
   }
@@ -288,15 +307,16 @@ SmmuV3FreeCommandQueue (
   Build an invalid stream-table entry used at init for every STE
   slot before any device has been mapped.
 
-  Implemented by reusing SmmuV3BuildTranslateStreamTableEntry with
-  PageTableRoot == NULL VMID=0 and VALID = 0.
+  Implemented by reusing SmmuV3BuildStage2TranslateStreamTableEntry (or
+  the Stage 1 counterpart when TranslationStage == SmmuTranslationStage1)
+  with PageTableRoot / Cd == NULL, VMID/ASID = 0, and VALID = 0.
 
   @param [in]  SmmuInfo     SMMU instance (needed for IDR-derived fields).
   @param [out] StreamEntry  STE buffer to populate.
 
   @retval EFI_SUCCESS            Success.
   @retval EFI_INVALID_PARAMETER  Invalid parameters.
-  @retval Other                  Failure from SmmuV3BuildTranslateStreamTableEntry.
+  @retval Other                  Failure from the underlying stage-specific STE builder.
 **/
 EFI_STATUS
 SmmuV3BuildInvalidStreamTableEntry (
@@ -309,8 +329,13 @@ SmmuV3BuildInvalidStreamTableEntry (
     return EFI_INVALID_PARAMETER;
   }
 
+  if (SmmuInfo->TranslationStage == SmmuTranslationStage1) {
+    // Cd == NULL and VALID == 0.
+    return SmmuV3BuildStage1TranslateStreamTableEntry (SmmuInfo, NULL, StreamEntry);
+  }
+
   // PageTableRoot==NULL VMID==0 and VALID==0.
-  return SmmuV3BuildTranslateStreamTableEntry (SmmuInfo, NULL, 0, StreamEntry);
+  return SmmuV3BuildStage2TranslateStreamTableEntry (SmmuInfo, NULL, 0, StreamEntry);
 }
 
 /**
@@ -326,7 +351,7 @@ SmmuV3BuildInvalidStreamTableEntry (
   @retval EFI_INVALID_PARAMETER  Invalid parameter.
 **/
 EFI_STATUS
-SmmuV3BuildTranslateStreamTableEntry (
+SmmuV3BuildStage2TranslateStreamTableEntry (
   IN  SMMU_INFO                  *SmmuInfo,
   IN  PAGE_TABLE                 *PageTableRoot,
   IN  UINT16                     Vmid,
@@ -653,7 +678,7 @@ SmmuV3GetSteSlot (
   @retval Other                  Command-queue / sync failure.
 **/
 EFI_STATUS
-SmmuV3PromoteSteToTranslate (
+SmmuV3PromoteSteToStage2Translate (
   IN  SMMU_INFO                  *SmmuInfo,
   IN  UINT32                     StreamId,
   IN  UINT16                     Vmid,
@@ -699,7 +724,7 @@ SmmuV3PromoteSteToTranslate (
   //
   // The init-time STE template installed by SmmuV3Configure has Valid=0,
   // so every promotion is an invalid -> valid transition.
-  Status = SmmuV3BuildTranslateStreamTableEntry (SmmuInfo, PageTableRoot, Vmid, &NewEntry);
+  Status = SmmuV3BuildStage2TranslateStreamTableEntry (SmmuInfo, PageTableRoot, Vmid, &NewEntry);
   if (EFI_ERROR (Status)) {
     DEBUG ((DEBUG_ERROR, "%a: Build translate STE failed for StreamId 0x%x: %r\n", __func__, StreamId, Status));
     return Status;
@@ -767,6 +792,350 @@ SmmuV3PromoteSteToTranslate (
     Vmid,
     SmmuInfo->SmmuBase,
     PageTableRoot
+    ));
+
+  return EFI_SUCCESS;
+}
+
+/**
+  Allocate a Context Descriptor (CD) for use as a Stage 1 STE's
+  S1ContextPtr. The CD is 64-byte aligned as required by SMMUv3 spec
+  section 5.4 and zero-initialized (V = 0). We allocate a whole page so
+  there is room to grow to substream-based CDs later.
+
+  @retval Pointer to the zeroed CD, or NULL on failure.
+**/
+SMMUV3_CONTEXT_DESCRIPTOR *
+SmmuV3AllocateContextDescriptor (
+  VOID
+  )
+{
+  SMMUV3_CONTEXT_DESCRIPTOR  *Cd;
+
+  Cd = (SMMUV3_CONTEXT_DESCRIPTOR *)AllocateAlignedPages (1, EFI_PAGE_SIZE);
+  if (Cd == NULL) {
+    DEBUG ((DEBUG_ERROR, "%a: Failed to allocate CD\n", __func__));
+    return NULL;
+  }
+
+  ZeroMem (Cd, EFI_PAGE_SIZE);
+  return Cd;
+}
+
+/**
+  Free a Context Descriptor previously returned by
+  SmmuV3AllocateContextDescriptor.
+
+  @param [in]  Cd  Context Descriptor to free. May be NULL.
+**/
+VOID
+SmmuV3FreeContextDescriptor (
+  IN SMMUV3_CONTEXT_DESCRIPTOR  *Cd
+  )
+{
+  if (Cd == NULL) {
+    return;
+  }
+
+  FreeAlignedPages ((VOID *)Cd, 1);
+}
+
+/**
+  Populate a Context Descriptor for Stage 1 identity-mapped translation.
+
+  Sets Ttb0 to PageTableRoot, ASID to the supplied tag, T0Sz / TG0 / IPS /
+  IR0 / OR0 / SH0 from the SMMU's OAS + coherency configuration, MAIR0 to
+  AttrIndex 0 = Normal WBWA (matching Stage 1 leaf PTEs), disables TTBR1,
+  and sets AArch64 + Valid = 1. PageTableRoot = NULL builds an invalid
+  (V = 0) CD.
+
+  @param [in]   SmmuInfo       SMMU instance (needed for IDR-derived fields).
+  @param [in]   PageTableRoot  Stage 1 page-table root to install in Ttb0,
+                               or NULL for an invalid CD.
+  @param [in]   Asid           ASID tag installed in CD.Asid.
+  @param [out]  Cd             CD buffer to populate.
+
+  @retval EFI_SUCCESS            Success.
+  @retval EFI_INVALID_PARAMETER  Invalid parameters.
+  @retval Other                  Failure from starting-level computation.
+**/
+EFI_STATUS
+SmmuV3BuildStage1ContextDescriptor (
+  IN  SMMU_INFO                  *SmmuInfo,
+  IN  PAGE_TABLE                 *PageTableRoot,
+  IN  UINT16                     Asid,
+  OUT SMMUV3_CONTEXT_DESCRIPTOR  *Cd
+  )
+{
+  EFI_STATUS   Status;
+  SMMUV3_IDR5  Idr5;
+  UINT32       InputAddressWidth;
+  UINT64       S2Sl0Unused;
+
+  if ((SmmuInfo == NULL) || (Cd == NULL)) {
+    DEBUG ((DEBUG_ERROR, "%a: Invalid Parameters\n", __func__));
+    return EFI_INVALID_PARAMETER;
+  }
+
+  ZeroMem ((VOID *)Cd, sizeof (SMMUV3_CONTEXT_DESCRIPTOR));
+
+  //
+  // Stage 1 4KB derives the walk starting level from CD.T0Sz per Arm ARM
+  // Table D8-6 (no SL0 field in the CD). Concatenation at the starting
+  // level is not architecturally allowed for Stage 1 (Arm ARM D8.5.2),
+  // so the shared helper picks L0 for wide inputs and L1 otherwise,
+  // always with PageTableRootConcatenated = FALSE. CD.T0Sz encodes the
+  // input width, and CD.IPS is driven off IDR5.OAS.
+  //
+  Idr5.AsUINT32     = SmmuV3ReadRegister32 (SmmuInfo->SmmuBase, SMMU_IDR5);
+  InputAddressWidth = SmmuV3DecodeAddressWidth (Idr5.Bits.Oas);
+  if (InputAddressWidth > SMMUV3_STREAM_TABLE_ENTRY_OUTPUT_ADDRESS_MAX) {
+    InputAddressWidth = SMMUV3_STREAM_TABLE_ENTRY_OUTPUT_ADDRESS_MAX;
+  }
+
+  SmmuInfo->OutputAddressWidth = InputAddressWidth;
+
+  Status = SmmuV3SetTranslationStartingLevel (SmmuInfo, InputAddressWidth, &S2Sl0Unused);
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "%a: Failed to set translation starting level for Stage 1\n", __func__));
+    return Status;
+  }
+
+  Cd->Bits.T0Sz  = 64 - InputAddressWidth;
+  Cd->Bits.Tg0   = SMMUV3_CD_TG0_4KB;
+  Cd->Bits.Ips   = SmmuV3EncodeAddressWidth (InputAddressWidth);
+  Cd->Bits.Epd1  = SMMUV3_CD_EPD1;                      // Disable TTBR1 walk.
+  Cd->Bits.Aa64  = SMMUV3_CD_AA64;
+  Cd->Bits.Ars   = SMMUV3_CD_ARS_ABORT_RECORD;
+  Cd->Bits.Asid  = Asid;
+  Cd->Bits.Mair0 = SMMUV3_CD_MAIR0_NORMAL_WBWA;         // AttrIndex 0 = Normal WBWA; AttrIndex 1 = Device.
+
+  // Match translation-table walk attributes to the Stage 2 STE builder
+  // above (always Inner+Outer WBWA + Inner shareable in this driver).
+  Cd->Bits.Ir0 = ARM64_RGNCACHEATTR_WRITEBACK_WRITEALLOCATE;
+  Cd->Bits.Or0 = ARM64_RGNCACHEATTR_WRITEBACK_WRITEALLOCATE;
+  Cd->Bits.Sh0 = ARM64_SHATTR_INNER_SHAREABLE;
+
+  if (PageTableRoot != NULL) {
+    Cd->Bits.Ttb0  = (UINT64)(UINTN)PageTableRoot >> SMMUV3_CD_TTB0_OFFSET;
+    Cd->Bits.Valid = SMMUV3_STREAM_TABLE_ENTRY_VALID;
+  } else {
+    Cd->Bits.Ttb0  = 0;
+    Cd->Bits.Valid = 0;
+  }
+
+  return EFI_SUCCESS;
+}
+
+/**
+  Build a STAGE_1_TRANSLATE / STAGE_2_BYPASS stream-table entry that
+  points at the supplied Context Descriptor. Passing Cd = NULL builds an
+  invalid (Valid = 0) STE suitable for the init-time template.
+
+  Selects linear single-CD format (S1Fmt = 0, S1CdMax = 0). The stream
+  translation regime (STRW) is left at the ZeroMem-implicit value 0
+  (Non-secure EL1&0), matching the Stage 2 STE builder. That pairs with
+  CMD_TLBI_NH_ASID (Stage 1) / CMD_TLBI_S12_VMALL (Stage 2), which flush
+  the NH partition. STRW = 0 is also universally implementable
+  (independent of IDR0.HYP / HTTU) and matches how bare-metal / hypervisor
+  operating systems re-program Stage 1 STEs after ExitBootServices.
+  STE.S2Vmid is fixed to SMMUV3_STREAM_TABLE_ENTRY_S1_ONLY_VMID per
+  SMMUv3 spec §5.2.
+
+  @param [in]   SmmuInfo     SMMU instance.
+  @param [in]   Cd           CD the STE's S1ContextPtr should point at, or
+                             NULL to build an invalid STE.
+  @param [out]  StreamEntry  STE buffer to populate.
+
+  @retval EFI_SUCCESS            Success.
+  @retval EFI_INVALID_PARAMETER  Invalid parameters.
+**/
+EFI_STATUS
+SmmuV3BuildStage1TranslateStreamTableEntry (
+  IN  SMMU_INFO                  *SmmuInfo,
+  IN  SMMUV3_CONTEXT_DESCRIPTOR  *Cd,
+  OUT SMMUV3_STREAM_TABLE_ENTRY  *StreamEntry
+  )
+{
+  SMMUV3_IDR1  Idr1;
+
+  if ((SmmuInfo == NULL) || (StreamEntry == NULL)) {
+    DEBUG ((DEBUG_ERROR, "%a: Invalid Parameters\n", __func__));
+    return EFI_INVALID_PARAMETER;
+  }
+
+  ZeroMem ((VOID *)StreamEntry, sizeof (SMMUV3_STREAM_TABLE_ENTRY));
+
+  Idr1.AsUINT32 = SmmuV3ReadRegister32 (SmmuInfo->SmmuBase, SMMU_IDR1);
+
+  StreamEntry->Bits.Config  = SMMUV3_STREAM_TABLE_ENTRY_CONFIG_STAGE_1_TRANSLATE_STAGE_2_BYPASS;
+  StreamEntry->Bits.S1Fmt   = SMMUV3_STREAM_TABLE_ENTRY_S1FMT_LINEAR;
+  StreamEntry->Bits.S1CdMax = SMMUV3_STREAM_TABLE_ENTRY_S1CDMAX_SINGLE_CD;
+  StreamEntry->Bits.Eats    = SMMUV3_STREAM_TABLE_ENTRY_EATS_NOT_SUPPORTED;
+
+  // Defense in depth: abort any DMA that arrives with SSID != 0 even
+  // though S1CdMax = 0 disables SubStreamIDs.
+  StreamEntry->Bits.S1Dss = SMMUV3_STREAM_TABLE_ENTRY_S1DSS_ABORT;
+
+  // Force stalling faults to terminate; the driver does not implement
+  // stall/resume.
+  StreamEntry->Bits.S1StallD = SMMUV3_STREAM_TABLE_ENTRY_S1STALLD_TERMINATE;
+
+  // Record Stage 1 faults in the event queue.
+  StreamEntry->Bits.S2Rs = SMMUV3_STREAM_TABLE_ENTRY_S2RS_RECORD_FAULTS;
+
+  // Per SMMUv3 §5.2: S2VMID is ignored when only Stage 1 is enabled;
+  // TLB entries are tagged with VMID = 0. TLB invalidation uses the same
+  // VMID value.
+  StreamEntry->Bits.S2Vmid = SMMUV3_STREAM_TABLE_ENTRY_S1_ONLY_VMID;
+
+  // Memory attributes for CD / Stage 1 translation-table walks. Match the
+  // Stage 2 STE builder (Inner+Outer WBWA + Inner shareable).
+  StreamEntry->Bits.S1Cir = ARM64_RGNCACHEATTR_WRITEBACK_WRITEALLOCATE;
+  StreamEntry->Bits.S1Cor = ARM64_RGNCACHEATTR_WRITEBACK_WRITEALLOCATE;
+  StreamEntry->Bits.S1Csh = ARM64_SHATTR_INNER_SHAREABLE;
+
+  if (Idr1.Bits.AttrTypesOvr != 0) {
+    StreamEntry->Bits.ShCfg = SMMUV3_STREAM_TABLE_ENTRY_SHCFG_INCOMING_SHAREABILITY;
+  }
+
+  if (Cd != NULL) {
+    StreamEntry->Bits.S1ContextPtr = (UINT64)(UINTN)Cd >> SMMUV3_STREAM_TABLE_ENTRY_S1CONTEXTPTR_OFFSET;
+    StreamEntry->Bits.Valid        = SMMUV3_STREAM_TABLE_ENTRY_VALID;
+  } else {
+    StreamEntry->Bits.S1ContextPtr = 0;
+    StreamEntry->Bits.Valid        = 0;
+  }
+
+  return EFI_SUCCESS;
+}
+
+/**
+  Promote the STE for StreamId from ABORT to STAGE_1_TRANSLATE /
+  STAGE_2_BYPASS with the supplied CD, using the break-before-make
+  sequence required for STE Config changes: write STE[1..7], DSB +
+  CFGI_STE(Leaf = 0) + SYNC, then publish STE[0] atomically, then DSB +
+  CFGI_STE + SYNC.
+
+  Mirrors SmmuV3PromoteSteToStage2Translate wrt the shared-ABORT L2
+  split-on-write path: for 2-level stream tables the caller passes a
+  page-sized NewL2 and receives back NewL2Consumed, indicating whether
+  it was installed by SmmuV3SplitL1IfShared.
+
+  @param [in]  SmmuInfo        Pointer to the SMMU_INFO structure.
+  @param [in]  StreamId        The StreamID whose STE is being promoted.
+  @param [in]  Cd              Context Descriptor to install in the STE.
+  @param [in]  NewL2           Caller-provided L2 page for the shared-L2
+                               split step. Not allocated or freed here.
+  @param [out] NewL2Consumed   TRUE if NewL2 was installed in an L1
+                               descriptor; FALSE otherwise.
+
+  @retval EFI_SUCCESS            Success.
+  @retval EFI_INVALID_PARAMETER  Invalid parameters.
+  @retval Other                  Command-queue / sync failure.
+**/
+EFI_STATUS
+SmmuV3PromoteSteToStage1Translate (
+  IN  SMMU_INFO                  *SmmuInfo,
+  IN  UINT32                     StreamId,
+  IN  SMMUV3_CONTEXT_DESCRIPTOR  *Cd,
+  IN  SMMUV3_STREAM_TABLE_ENTRY  *NewL2,
+  OUT BOOLEAN                    *NewL2Consumed
+  )
+{
+  EFI_STATUS                 Status;
+  SMMUV3_STREAM_TABLE_ENTRY  *SteSlot;
+  SMMUV3_STREAM_TABLE_ENTRY  NewEntry;
+  SMMUV3_CMD_GENERIC         Command;
+  UINTN                      Index;
+
+  if ((SmmuInfo == NULL) || (Cd == NULL) || (NewL2 == NULL) || (NewL2Consumed == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  *NewL2Consumed = FALSE;
+
+  // 2-level only: split any L1 slot that still points at the shared-ABORT
+  // L2 before mutating the STE.
+  if (SmmuInfo->SharedAbortL2 != NULL) {
+    Status = SmmuV3SplitL1IfShared (SmmuInfo, StreamId, NewL2, NewL2Consumed);
+    if (EFI_ERROR (Status)) {
+      DEBUG ((DEBUG_ERROR, "%a: SmmuV3SplitL1IfShared failed for StreamId 0x%x: %r\n", __func__, StreamId, Status));
+      return Status;
+    }
+  }
+
+  SteSlot = SmmuV3GetSteSlot (SmmuInfo, StreamId);
+  if (SteSlot == NULL) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  Status = SmmuV3BuildStage1TranslateStreamTableEntry (SmmuInfo, Cd, &NewEntry);
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "%a: Build Stage 1 STE failed for StreamId 0x%x: %r\n", __func__, StreamId, Status));
+    return Status;
+  }
+
+  //
+  // 1. Write STE UINT64[1..7]; leave [0] (Valid + Config) untouched.
+  //
+  for (Index = 1; Index < (sizeof (SMMUV3_STREAM_TABLE_ENTRY) / sizeof (UINT64)); Index++) {
+    SteSlot->AsUINT64[Index] = NewEntry.AsUINT64[Index];
+  }
+
+  //
+  // 2. DSB + CFGI_STE(Leaf = 0) + SYNC so the SMMU drops any cached
+  //    STE / CD state derived from the old contents before we publish
+  //    Valid = 1.
+  //
+  ArmDataSynchronizationBarrier ();
+
+  SMMUV3_BUILD_CMD_CFGI_STE (&Command, StreamId, 0);
+  Status = SmmuV3SendCommand (SmmuInfo, &Command);
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "%a: CFGI_STE (pre-valid) failed for StreamId 0x%x: %r\n", __func__, StreamId, Status));
+    return Status;
+  }
+
+  SMMUV3_BUILD_CMD_SYNC_NO_INTERRUPT (&Command);
+  Status = SmmuV3SendCommand (SmmuInfo, &Command);
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "%a: CMD_SYNC (pre-valid) failed for StreamId 0x%x: %r\n", __func__, StreamId, Status));
+    return Status;
+  }
+
+  //
+  // 3. Publish SteSlot[0] (Valid + Config) with a single atomic 64-bit write.
+  //
+  SteSlot->AsUINT64[0] = NewEntry.AsUINT64[0];
+
+  //
+  // 4. Final DSB + CFGI_STE + SYNC.
+  //
+  ArmDataSynchronizationBarrier ();
+
+  SMMUV3_BUILD_CMD_CFGI_STE (&Command, StreamId, 0);
+  Status = SmmuV3SendCommand (SmmuInfo, &Command);
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "%a: CFGI_STE (post-valid) failed for StreamId 0x%x: %r\n", __func__, StreamId, Status));
+    return Status;
+  }
+
+  SMMUV3_BUILD_CMD_SYNC_NO_INTERRUPT (&Command);
+  Status = SmmuV3SendCommand (SmmuInfo, &Command);
+  if (EFI_ERROR (Status)) {
+    DEBUG ((DEBUG_ERROR, "%a: CMD_SYNC (post-valid) failed for StreamId 0x%x: %r\n", __func__, StreamId, Status));
+    return Status;
+  }
+
+  DEBUG ((
+    DEBUG_INFO,
+    "%a: Promoted STE StreamId=0x%x ASID=0x%x on SmmuBase=0x%llx to STAGE_1_TRANSLATE, CD=0x%p\n",
+    __func__,
+    StreamId,
+    (UINT32)Cd->Bits.Asid,
+    SmmuInfo->SmmuBase,
+    Cd
     ));
 
   return EFI_SUCCESS;
@@ -906,7 +1275,7 @@ SmmuV3InitStreamTable (
   // S2Ttb = 0 (no page-table root yet) and Valid = 0, so any DMA from a non-promoted
   // StreamID will trigger a SMMU fault and be recorded in
   // the event queue. The first IoMmu Map/SetAttribute for a StreamID
-  // publishes a real S2Ttb in-place via SmmuV3PromoteSteToTranslate().
+  // publishes a real S2Ttb in-place via SmmuV3PromoteSteToStage2Translate().
   Status = SmmuV3BuildInvalidStreamTableEntry (SmmuInfo, &TemplateEntry);
   if (EFI_ERROR (Status)) {
     DEBUG ((DEBUG_ERROR, "%a: Error building init STE template\n", __func__));
@@ -1106,15 +1475,8 @@ SmmuV3EnableQueuesAndInvalidate (
     return Status;
   }
 
-  SMMUV3_BUILD_CMD_TLBI_EL2_ALL (&Command);
-  Status = SmmuV3SendCommand (SmmuInfo, &Command);
-  if (EFI_ERROR (Status)) {
-    DEBUG ((DEBUG_ERROR, "%a: Error sending command.\n", __func__));
-    return Status;
-  }
-
   // Issue a CMD_SYNC command to guarantee that any previously issued TLB
-  // invalidations (CMD_TLBI_*) are completed (SMMUv3.2 spec section 4.6.3).
+  // invalidations (CMD_TLBI_*) are completed (SMMUv3 spec section 4.6.3).
   SMMUV3_BUILD_CMD_SYNC_NO_INTERRUPT (&Command);
   Status = SmmuV3SendCommand (SmmuInfo, &Command);
   if (EFI_ERROR (Status)) {
@@ -1230,19 +1592,40 @@ SmmuV3Configure (
     return EFI_UNSUPPORTED;
   }
 
-  // Check for Stage 2 translation support
-  if (Idr0.Bits.S2p == 0) {
-    DEBUG ((DEBUG_ERROR, "%a: SMMU does not support stage 2 translation.\n", __func__));
-    return EFI_UNSUPPORTED;
+  // Check translation-stage support based on the platform's configured
+  // TranslationStage.
+  if (SmmuInfo->TranslationStage == SmmuTranslationStage1) {
+    if (Idr0.Bits.S1p == 0) {
+      DEBUG ((DEBUG_ERROR, "%a: SMMU 0x%llx does not support stage 1 translation.\n", __func__, SmmuInfo->SmmuBase));
+      return EFI_UNSUPPORTED;
+    }
+  } else {
+    // Check for Stage 2 translation support
+    if (Idr0.Bits.S2p == 0) {
+      DEBUG ((DEBUG_ERROR, "%a: SMMU does not support stage 2 translation.\n", __func__));
+      return EFI_UNSUPPORTED;
+    }
   }
 
   // Check for 2-level stream table support.
   SmmuInfo->TwoLevelStreamTableSupported = (Idr0.Bits.StLevel != 0);
 
-  // Cache VMID width and seed the per-stream VMID allocator. VMID 0 is
+  // Cache VMID/ASID width and seed the allocators. Both 0 values are
   // reserved as "unassigned" so the allocator starts at 1.
   SmmuInfo->Vmid16Supported = (Idr0.Bits.Vmid16 != 0);
   SmmuInfo->NextVmid        = 1;
+  SmmuInfo->Asid16Supported = (Idr0.Bits.Asid16 != 0);
+  SmmuInfo->NextAsid        = 1;
+
+  DEBUG ((
+    DEBUG_VERBOSE,
+    "%a: SMMU 0x%llx VMID=%u bits ASID=%u bits TranslationStage=%u\n",
+    __func__,
+    SmmuInfo->SmmuBase,
+    SmmuInfo->Vmid16Supported ? 16u : 8u,
+    SmmuInfo->Asid16Supported ? 16u : 8u,
+    (UINT32)SmmuInfo->TranslationStage
+    ));
 
   // Disable SMMU before configuring
   Status = SmmuV3DisableTranslation (SmmuInfo->SmmuBase);
@@ -1431,61 +1814,116 @@ SmmuV3FreePerStreamPageTableRoots (
   )
 {
   PAGE_TABLE                 **FreedRoots;
+  SMMUV3_CONTEXT_DESCRIPTOR  **FreedCds;
   UINTN                      MaxRoots;
   UINTN                      FreedCount;
+  UINTN                      FreedCdCount;
   UINTN                      MaxStreamId;
   UINTN                      StreamId;
   UINTN                      DupIdx;
   SMMUV3_STREAM_TABLE_ENTRY  *Ste;
+  SMMUV3_CONTEXT_DESCRIPTOR  *Cd;
   PAGE_TABLE                 *Root;
   BOOLEAN                    IsDup;
+  BOOLEAN                    IsStage1;
 
   if ((SmmuInfo == NULL) || (SmmuInfo->StreamTable == NULL)) {
     return;
   }
 
-  // Upper bound on unique roots = VMIDs handed out by the allocator
-  // (each call hands out one VMID before allocating a fresh root). If
-  // NextVmid wrapped to 0, every VMID in the configured width is in
-  // use.
-  MaxRoots = (SmmuInfo->NextVmid == SMMU_VMID_RESERVED)
-             ? (SmmuInfo->Vmid16Supported ? MAX_UINT16 : MAX_UINT8)
-             : (SmmuInfo->NextVmid - 1);
-  FreedRoots = NULL;
-  FreedCount = 0;
+  IsStage1 = (SmmuInfo->TranslationStage == SmmuTranslationStage1);
+
+  // Upper bound on unique roots = number of tags handed out by the
+  // per-stream allocator (each call hands out one VMID / ASID before
+  // allocating a fresh root). If the counter wrapped to the reserved 0,
+  // every tag in the configured width is in use.
+  if (IsStage1) {
+    MaxRoots = (SmmuInfo->NextAsid == SMMU_ASID_RESERVED)
+               ? (SmmuInfo->Asid16Supported ? MAX_UINT16 : MAX_UINT8)
+               : (SmmuInfo->NextAsid - 1);
+  } else {
+    MaxRoots = (SmmuInfo->NextVmid == SMMU_VMID_RESERVED)
+               ? (SmmuInfo->Vmid16Supported ? MAX_UINT16 : MAX_UINT8)
+               : (SmmuInfo->NextVmid - 1);
+  }
+
+  FreedRoots   = NULL;
+  FreedCds     = NULL;
+  FreedCount   = 0;
+  FreedCdCount = 0;
   if (MaxRoots > 0) {
     FreedRoots = (PAGE_TABLE **)AllocateZeroPool (MaxRoots * sizeof (PAGE_TABLE *));
+    if (IsStage1) {
+      FreedCds = (SMMUV3_CONTEXT_DESCRIPTOR **)AllocateZeroPool (MaxRoots * sizeof (SMMUV3_CONTEXT_DESCRIPTOR *));
+    }
   }
 
   // Walk every STE slot. SmmuV3GetSteSlot transparently handles both
   // linear and 2-level (including the shared-ABORT L2). If we cannot
   // allocate the dedupe buffer, leak rather than risk double-free.
-  if ((MaxRoots == 0) || (FreedRoots != NULL)) {
+  if ((MaxRoots == 0) || ((FreedRoots != NULL) && (!IsStage1 || (FreedCds != NULL)))) {
     MaxStreamId = SmmuInfo->StreamTableEntryMax;
     for (StreamId = 0; StreamId <= MaxStreamId; StreamId++) {
       Ste = SmmuV3GetSteSlot (SmmuInfo, (UINT32)StreamId);
-      if ((Ste == NULL) || (Ste->Bits.Valid == 0) || (Ste->Bits.S2Ttb == 0)) {
+      if ((Ste == NULL) || (Ste->Bits.Valid == 0)) {
         continue;
       }
 
-      Root  = (PAGE_TABLE *)(UINTN)((UINT64)Ste->Bits.S2Ttb << SMMUV3_STREAM_TABLE_ENTRY_S2TTB_OFFSET);
-      IsDup = FALSE;
-      for (DupIdx = 0; DupIdx < FreedCount; DupIdx++) {
-        if (FreedRoots[DupIdx] == Root) {
-          IsDup = TRUE;
-          break;
+      if (IsStage1) {
+        if (Ste->Bits.S1ContextPtr == 0) {
+          continue;
+        }
+
+        Cd = (SMMUV3_CONTEXT_DESCRIPTOR *)(UINTN)((UINT64)Ste->Bits.S1ContextPtr << SMMUV3_STREAM_TABLE_ENTRY_S1CONTEXTPTR_OFFSET);
+        if (Cd == NULL) {
+          continue;
+        }
+
+        Root = (PAGE_TABLE *)(UINTN)((UINT64)Cd->Bits.Ttb0 << SMMUV3_CD_TTB0_OFFSET);
+      } else {
+        if (Ste->Bits.S2Ttb == 0) {
+          continue;
+        }
+
+        Cd   = NULL;
+        Root = (PAGE_TABLE *)(UINTN)((UINT64)Ste->Bits.S2Ttb << SMMUV3_STREAM_TABLE_ENTRY_S2TTB_OFFSET);
+      }
+
+      if (Root != NULL) {
+        IsDup = FALSE;
+        for (DupIdx = 0; DupIdx < FreedCount; DupIdx++) {
+          if (FreedRoots[DupIdx] == Root) {
+            IsDup = TRUE;
+            break;
+          }
+        }
+
+        if (!IsDup) {
+          if ((FreedRoots != NULL) && (FreedCount < MaxRoots)) {
+            FreedRoots[FreedCount++] = Root;
+          }
+
+          SmmuV3FreePageTableTree (SmmuInfo, 0, Root);
         }
       }
 
-      if (IsDup) {
-        continue;
-      }
+      if (IsStage1 && (Cd != NULL)) {
+        IsDup = FALSE;
+        for (DupIdx = 0; DupIdx < FreedCdCount; DupIdx++) {
+          if (FreedCds[DupIdx] == Cd) {
+            IsDup = TRUE;
+            break;
+          }
+        }
 
-      if ((FreedRoots != NULL) && (FreedCount < MaxRoots)) {
-        FreedRoots[FreedCount++] = Root;
-      }
+        if (!IsDup) {
+          if ((FreedCds != NULL) && (FreedCdCount < MaxRoots)) {
+            FreedCds[FreedCdCount++] = Cd;
+          }
 
-      SmmuV3FreePageTableTree (0, Root);
+          SmmuV3FreeContextDescriptor (Cd);
+        }
+      }
     }
   } else {
     DEBUG ((DEBUG_ERROR, "%a: Failed to allocate dedupe buffer; leaking per-stream roots on SMMU 0x%llx\n", __func__, SmmuInfo->SmmuBase));
@@ -1493,6 +1931,10 @@ SmmuV3FreePerStreamPageTableRoots (
 
   if (FreedRoots != NULL) {
     FreePool (FreedRoots);
+  }
+
+  if (FreedCds != NULL) {
+    FreePool (FreedCds);
   }
 }
 
@@ -1804,13 +2246,23 @@ InitializeSmmuDxe (
   // Configure SMMUv3 hardware
   for (SmmuIndex = 0; SmmuIndex < mIoMmu->SmmuCount; SmmuIndex++) {
     if (mIoMmu->SmmuInfo[SmmuIndex].Enabled) {
+      mIoMmu->SmmuInfo[SmmuIndex].TranslationStage = (SmmuConfig->TranslationStage == SmmuTranslationStage1)
+                                                     ? SmmuTranslationStage1
+                                                     : SmmuTranslationStage2;
       Status = SmmuV3Configure (&mIoMmu->SmmuInfo[SmmuIndex]);
       if (EFI_ERROR (Status)) {
         DEBUG ((DEBUG_ERROR, "%a: Failed to configure SMMUv3 hardware\n", __func__));
         goto Error;
       }
 
-      DEBUG ((DEBUG_INFO, "%a: SMMUv3 0x%llx is configured for Stage2 Translation\n", __func__, mIoMmu->SmmuInfo[SmmuIndex].SmmuBase));
+      DEBUG ((
+        DEBUG_INFO,
+        "%a: SMMUv3 0x%llx is configured for %a Translation with starting level 0x%llx\n",
+        __func__,
+        mIoMmu->SmmuInfo[SmmuIndex].SmmuBase,
+        (mIoMmu->SmmuInfo[SmmuIndex].TranslationStage == SmmuTranslationStage1) ? "Stage1" : "Stage2",
+        mIoMmu->SmmuInfo[SmmuIndex].TranslationStartingLevel
+        ));
 
       // Pre-map any IORT RMR ranges into the per-StreamID page tables that the RMR's IdMappings cover.
       Status = SmmuV3AddRMRMapping (&mIoMmu->SmmuInfo[SmmuIndex]);

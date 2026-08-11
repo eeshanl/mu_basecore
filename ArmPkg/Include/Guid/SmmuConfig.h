@@ -22,7 +22,7 @@
 // Future backwards compatibility is only possible if new fields are added to the end of the structure and existing fields are not modified.
 // SmmuDxe driver will check and enforce the version of the SMMU_CONFIG structure to this current version set here.
 #define CURRENT_SMMU_CONFIG_VERSION_MAJOR  1
-#define CURRENT_SMMU_CONFIG_VERSION_MINOR  0
+#define CURRENT_SMMU_CONFIG_VERSION_MINOR  1
 
 #pragma pack(push, 1)
 
@@ -31,10 +31,16 @@
 // IORT Named Component ObjectName
 #define SMMU_NC_DEVICE_OBJNAME_MAX  32
 
+// Per-SMMU translation stage selection. Every SMMU described by the HOB is
+// configured for the same stage.
+typedef enum _SMMU_TRANSLATION_STAGE {
+  SmmuTranslationStage2 = 0, // Stage 2 translate, Stage 1 bypass
+  SmmuTranslationStage1 = 1, // Stage 1 translate, Stage 2 bypass
+} SMMU_TRANSLATION_STAGE;
+
 // Platform-provided lookup entry mapping a NonDiscoverable device's
 // PciIo->GetLocation()-derived UniqueId to the SMMU StreamID's associated
 // with the NamedComponent node in the IORT.
-//
 // Each NonDiscoverable device exposes a UniqueId from the NonDiscoverableDeviceRegistrationLib.
 // This is used to determine a determinstic PciIo->GetLocation().
 typedef struct _SMMU_NC_DEVICE_ENTRY {
@@ -46,14 +52,17 @@ typedef struct _SMMU_NC_DEVICE_ENTRY {
 // Platform will configure SmmuDisabledList size and offset to the SMMU disabled list appropriatley
 // for any SMMU that needs be disabled in UEFI and set to bypass.
 typedef struct _SMMU_CONFIG {
-  UINT32    VersionMajor;
-  UINT32    VersionMinor;
-  UINT32    SmmuDisabledListSize;   // Size of SmmuDisabledList in bytes.
-  UINT32    SmmuDisabledListOffset; // Offset in bytes to the SmmuDisabledList from the start of the HOB structure.
-  UINT32    IortSize;
-  UINT32    IortOffset;             // Offset in bytes to the IORT table from the start of the HOB structure.
-  UINT32    NcDeviceListSize;       // Size of the NonDiscoverable device lookup array in bytes (multiple of sizeof(SMMU_NC_DEVICE_ENTRY)).
-  UINT32    NcDeviceListOffset;     // Offset in bytes to the NonDiscoverable device lookup array from the start of the HOB structure. 0 if absent.
+  UINT32                    VersionMajor;
+  UINT32                    VersionMinor;
+  UINT32                    SmmuDisabledListSize;   // Size of SmmuDisabledList in bytes.
+  UINT32                    SmmuDisabledListOffset; // Offset in bytes to the SmmuDisabledList from the start of the HOB structure.
+  UINT32                    IortSize;
+  UINT32                    IortOffset;             // Offset in bytes to the IORT table from the start of the HOB structure.
+  UINT32                    NcDeviceListSize;       // Size of the NonDiscoverable device lookup array in bytes (multiple of sizeof(SMMU_NC_DEVICE_ENTRY)).
+  UINT32                    NcDeviceListOffset;     // Offset in bytes to the NonDiscoverable device lookup array from the start of the HOB structure. 0 if absent.
+  SMMU_TRANSLATION_STAGE    TranslationStage;       // SmmuTranslationStage2 (default) or SmmuTranslationStage1.
+                                                    // SmmuDxe will configure every SMMU described by this HOB to the same stage.
+                                                    // Any value other than SmmuTranslationStage1 is treated as SmmuTranslationStage2.
 } SMMU_CONFIG;
 
 #pragma pack(pop)
